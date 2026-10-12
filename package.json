@@ -1,0 +1,24 @@
+{
+  "name": "dealtitude-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "migrate": "node src/migrate.js",
+    "keys": "node src/keys.js",
+    "test": "bash test/run.sh",
+    "shop": "node scripts/shop.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.4",
+    "hono": "^4.13.13",
+    "postgres": "^3.4.9",
+    "web-push": "^3.6.7",
+    "zod": "^4.6.5"
+  }
+}

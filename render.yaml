@@ -1,0 +1,59 @@
+# Render blueprint for the Dealtitude API.
+#
+# Point Render at this repo and it reads this file: a web service and a
+# Postgres database, wired together, with the secrets left blank for you to
+# paste in. Nothing here needs editing before the first deploy.
+services:
+  - type: web
+    name: dealtitude-api
+    runtime: node
+    plan: starter            # free tier sleeps after 15 min; a sleeping API
+                             # means a shopper's follow silently fails, so this
+                             # is the one place not to economise
+    region: ohio
+    buildCommand: npm ci --omit=dev
+    # Schema first, every boot. It is idempotent, so this can never half-apply.
+    startCommand: node src/migrate.js && node src/server.js
+    healthCheckPath: /v1/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: dealtitude-db
+          property: connectionString
+
+      # Web Push. Generate once with `npm run keys` and paste both in.
+      # NEVER regenerate these: new keys silently break every phone that has
+      # already subscribed, and those people simply stop hearing anything.
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        value: mailto:hello@dealtitude.com
+
+      # Where the app lives. Sign-in links are built from this, so a wrong
+      # value produces links that land nowhere.
+      - key: APP_URL
+        value: https://dealtitude.com
+      - key: ALLOWED_ORIGINS
+        value: https://dealtitude.com,https://www.dealtitude.com
+
+      # Operator key for the admin routes. Long and random.
+      - key: ADMIN_KEY
+        generateValue: true
+
+      # Mail. Leave unset and sign-in links are written to the service log
+      # instead, which is enough to run a pilot by hand.
+      - key: RESEND_API_KEY
+        sync: false
+      - key: MAIL_FROM
+        value: Dealtitude <hello@dealtitude.com>
+
+databases:
+  - name: dealtitude-db
+    plan: basic-256mb
+    region: ohio
+    postgresMajorVersion: "16"
