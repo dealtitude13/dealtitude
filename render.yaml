@@ -34,12 +34,37 @@ services:
       - key: VAPID_SUBJECT
         value: mailto:hello@dealtitude.com
 
+      # Apple push, for the App Store build. Leave blank until there is an
+      # iPhone app; /v1/health reports which routes are actually live.
+      # The .p8 key downloads ONCE from the Developer portal — keep a copy.
+      - key: APNS_KEY_ID
+        sync: false
+      - key: APNS_TEAM_ID
+        sync: false
+      - key: APNS_KEY_P8
+        sync: false
+      - key: APNS_BUNDLE_ID
+        value: com.dealtitude.app
+
+      # Google push, for the Play Store build. The whole service-account JSON
+      # from the Firebase console, pasted as one value.
+      - key: FCM_SERVICE_ACCOUNT
+        sync: false
+
       # Where the app lives. Sign-in links are built from this, so a wrong
       # value produces links that land nowhere.
       - key: APP_URL
-        value: https://bespoke-syrniki-dd8e0d.netlify.app
+        value: https://dealtitude.com
       - key: ALLOWED_ORIGINS
-        value: https://bespoke-syrniki-dd8e0d.netlify.app,https://dealtitude.com
+        value: https://dealtitude.com,https://www.dealtitude.com
+
+      # App Store review sign-in. One address, one fixed code, handed to Apple
+      # in the review notes because a reviewer has no inbox of ours. Blank =
+      # the route does not exist. Invite that address to a demo shop only.
+      - key: REVIEW_EMAIL
+        sync: false
+      - key: REVIEW_CODE
+        sync: false
 
       # Operator key for the admin routes. Long and random.
       - key: ADMIN_KEY

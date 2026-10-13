@@ -12,6 +12,9 @@
  *        --aisles produce,dairy,sweets,pantry,frozen \
  *        --hours "8:00 AM – 9:00 PM" --cap 3
  *
+ *   A shop that sells alcohol MUST be created with --min-age 21. Both app
+ *   stores require the gate, and it is the shop's own licence on the line.
+ *
  *   node scripts/shop.mjs invite brownbros owner@brownbros.com
  *   node scripts/shop.mjs list
  *   node scripts/shop.mjs reach brownbros
@@ -36,7 +39,7 @@ switch (cmd) {
   case "add": {
     const [slug, name, address, town, zip] = args;
     if (!slug || !name || !address || !town || !zip)
-      die("usage: add <slug> <name> <address> <town> <zip> [--aisles a,b,c] [--hours ..] [--cap n]");
+      die("usage: add <slug> <name> <address> <town> <zip> [--aisles a,b,c] [--hours ..] [--cap n] [--min-age 21]");
     if (!/^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/.test(slug))
       die(`"${slug}" won't work as a slug — lowercase letters, numbers and hyphens only.\n` +
           "It becomes the printed address on the counter card, so keep it short.");
@@ -46,12 +49,14 @@ switch (cmd) {
           "only hours and announcements could ever reach a follower.");
 
     const [shop] = await sql`
-      insert into shops (slug, name, address, town, zip, hours, daily_cap)
+      insert into shops (slug, name, address, town, zip, hours, daily_cap, min_age)
       values (${slug}, ${name}, ${address}, ${town}, ${zip},
-              ${flags.hours || null}, ${Number(flags.cap || 3)})
+              ${flags.hours || null}, ${Number(flags.cap || 3)},
+              ${flags["min-age"] ? Number(flags["min-age"]) : null})
       on conflict (slug) do update
         set name = excluded.name, address = excluded.address, town = excluded.town,
-            zip = excluded.zip, hours = excluded.hours, daily_cap = excluded.daily_cap
+            zip = excluded.zip, hours = excluded.hours, daily_cap = excluded.daily_cap,
+            min_age = excluded.min_age
       returning *`;
 
     await sql`insert into shop_aisles ${sql(aisles.map((a, i) => ({
@@ -64,6 +69,8 @@ switch (cmd) {
     console.log(`  card address   ${process.env.APP_URL || "https://dealtitude.com"}/${shop.slug}`);
     console.log(`  aisles         ${aisles.join(", ")}`);
     console.log(`  daily cap      ${shop.daily_cap} alerts per follower per day`);
+    if (shop.min_age)
+      console.log(`  age gate       ${shop.min_age}+ — shoppers confirm their age before following`);
     console.log(`\nNext:  node scripts/shop.mjs invite ${shop.slug} <their email>`);
     break;
   }
@@ -135,6 +142,7 @@ switch (cmd) {
 
   node scripts/shop.mjs add <slug> <name> <address> <town> <zip> \\
        --aisles produce,dairy,sweets --hours "8 AM – 9 PM" --cap 3
+       (a shop selling alcohol also needs --min-age 21)
   node scripts/shop.mjs invite <slug> <email>
   node scripts/shop.mjs list
   node scripts/shop.mjs reach <slug>

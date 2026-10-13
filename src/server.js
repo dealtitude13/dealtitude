@@ -1,11 +1,11 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
 import { sql, healthy } from "./db.js";
 import { publish } from "./publish.js";
-import { publicKey, pushConfigured } from "./push.js";
+import { publicKey, pushConfigured, backends } from "./push.js";
 import {
   newToken, store, deviceFrom, ownerFrom, holdsShop, isAdmin,
 } from "./auth.js";
@@ -13,8 +13,32 @@ import { sendSignInLink, mailConfigured } from "./mail.js";
 
 const app = new Hono();
 
+/* The installed app is not served from your website.
+ *
+ * On a phone the web view loads from a scheme of the platform's choosing —
+ * capacitor://localhost on iOS, https://localhost on Android — and that is the
+ * origin every request from the App Store build carries. It is a fact of the
+ * platform rather than a deployment choice, so it belongs here and not in an
+ * environment variable somebody has to remember.
+ *
+ * Leaving these out blocks every single request the installed app makes, and
+ * the app can only report it as "couldn't reach Dealtitude" — which sends you
+ * looking at your wifi rather than at this list. */
+const NATIVE_ORIGINS = [
+  "capacitor://localhost",      // iOS
+  "https://localhost",          // Android
+  "ionic://localhost",          // older builds, harmless to keep
+];
+
+const configured = (process.env.ALLOWED_ORIGINS || "*")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+
+export const allowedOrigins = configured.includes("*")
+  ? "*"
+  : [...new Set([...configured, ...NATIVE_ORIGINS])];
+
 app.use("*", cors({
-  origin: (process.env.ALLOWED_ORIGINS || "*").split(",").map((s) => s.trim()),
+  origin: allowedOrigins,
   allowHeaders: ["content-type", "authorization", "x-admin-key"],
   allowMethods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
 }));
@@ -62,9 +86,16 @@ app.get("/v1/health", async (c) => {
     ok: db && pushConfigured,
     db,
     push: pushConfigured,
+    /* Which routes to a lock screen are actually wired up. A native build
+       whose keys never made it into the environment looks identical to a
+       working one until the first alert vanishes, so it is stated here. */
+    push_backends: backends(),
     mail: mailConfigured,
+    /* Whether the App Store reviewer can get in. Worth seeing at a glance:
+       its absence is only discovered through a rejection, days later. */
+    review_sign_in: reviewSignInEnabled,
     app_url: process.env.APP_URL || null,
-    origins: (process.env.ALLOWED_ORIGINS || "*").split(",").map((s) => s.trim()),
+    origins: allowedOrigins,
     build: process.env.RENDER_GIT_COMMIT?.slice(0, 7) || null,
   }, db ? 200 : 503);
 });
@@ -80,11 +111,32 @@ app.get("/v1/push-key", (c) =>
    whose iPhone is not on the home screen yet, still gets a device so they can
    follow a shop and open the app to see what is on — and still counts as
    unreachable in the shop's reach figure until they have a subscription. */
+/* `endpoint` means two different things depending on the route a phone is
+   reachable by: a Web Push subscription URL for a browser, or an opaque APNs /
+   FCM device token for an App Store or Play Store build. They have to be told
+   apart rather than waved through, because a native token stored as a webpush
+   row would be handed to the web-push library and fail forever — a follower
+   who is counted, never written to, and never retired. */
 const DeviceIn = z.object({
-  endpoint: z.string().url().max(2000).optional(),
+  endpoint: z.string().min(8).max(2000).optional(),
   p256dh: z.string().max(400).optional(),
   auth: z.string().max(400).optional(),
   kind: z.enum(["none", "webpush", "apns", "fcm"]).optional(),
+}).superRefine((v, ctx) => {
+  if (!v.endpoint) return;
+  const kind = v.kind || "webpush";
+  const bad = (m) => ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["endpoint"], message: m });
+
+  if (kind === "webpush") {
+    let u;
+    try { u = new URL(v.endpoint); } catch { return bad("endpoint must be a push subscription URL"); }
+    if (u.protocol !== "https:") bad("a push subscription must be https");
+    return;
+  }
+  if (kind === "none") return bad("a device with no notifications has no endpoint");
+  /* Apple sends hex; Google sends a longer base64url-ish string with a colon.
+     Neither is ever a URL, and anything with a slash or a space is a mistake. */
+  if (!/^[A-Za-z0-9_:.-]{32,}$/.test(v.endpoint)) bad("that is not a valid device token");
 });
 
 app.post("/v1/device", async (c) => {
@@ -231,9 +283,41 @@ app.patch("/v1/device", async (c) => {
   return c.json({ device_id: d.id, merged: false });
 });
 
+/* ------------------------------------------------------------- age gate --- */
+/* A liquor shop's alerts are alcohol marketing, and both app stores require a
+   gate in front of them.
+ *
+ * The phone asks for a date of birth, works out the answer there, and sends
+ * only the bar it cleared. No birth date reaches this server, so there is none
+ * stored here — which is the honest version of a promise the shop owners were
+ * already told: Dealtitude knows how many followers they have, never who.
+ *
+ * This is an attestation, like every age gate on the consumer internet. It is
+ * what the app stores ask for; it is not identity verification and is not
+ * described as one anywhere in the product. */
+
+const AgeIn = z.object({ min_age: z.number().int().min(13).max(25) });
+
+app.post("/v1/device/age", async (c) => {
+  const device = await need(c);
+  const b = parse(AgeIn, await c.req.json());
+  /* Highest bar wins: clearing 21 also clears 18, and a later lower answer
+     must not quietly walk back an earlier one. */
+  await sql`
+    update devices
+       set age_ok_to = greatest(coalesce(age_ok_to, 0), ${b.min_age}),
+           age_ok_at = now(), last_seen_at = now()
+     where id = ${device.id}`;
+  return c.json({ age_ok_to: b.min_age });
+});
+
+/** Has this caller cleared the bar for this shop? Shops with no bar: always. */
+const oldEnough = (device, shop) =>
+  !shop.min_age || (device?.age_ok_to != null && device.age_ok_to >= shop.min_age);
+
 /* ----------------------------------------------------------------- shops -- */
 const shopShape = sql`
-  s.id, s.slug, s.name, s.address, s.town, s.zip, s.hours, s.daily_cap`;
+  s.id, s.slug, s.name, s.address, s.town, s.zip, s.hours, s.daily_cap, s.min_age`;
 
 app.get("/v1/shops", async (c) => {
   const zip = (c.req.query("zip") || "").trim();
@@ -255,6 +339,15 @@ app.get("/v1/shops/:slug", async (c) => {
            (select count(*) from follows f where f.shop_id = s.id) as followers
       from shops s where s.slug = ${c.req.param("slug")} and s.active`;
   if (!s) return fail(c, 404, "no such shop");
+
+  /* The shop's name, address and hours are not alcohol content and stay
+     visible — a printed card has to land somewhere that makes sense. What is
+     held back is the marketing: the posts. The app shows the gate in their
+     place, so this is the lock behind that door rather than the door itself. */
+  if (s.min_age && !oldEnough(await deviceFrom(c), s)) {
+    return c.json({ shop: s, posts: [], age_gated: true });
+  }
+
   const posts = await sql`
     select id, kind, aisle, name, note, was_cents, now_cents, ends, created_at
       from posts where shop_id = ${s.id} and status = 'active'
@@ -274,8 +367,15 @@ const FollowIn = z.object({ aisles: z.array(z.string().max(40)).max(40).default(
 app.post("/v1/shops/:slug/follow", async (c) => {
   const device = await need(c);
   const b = parse(FollowIn, await c.req.json().catch(() => ({})));
-  const [shop] = await sql`select id from shops where slug = ${c.req.param("slug")} and active`;
+  const [shop] = await sql`
+    select id, min_age from shops where slug = ${c.req.param("slug")} and active`;
   if (!shop) return fail(c, 404, "no such shop");
+  /* Following IS the subscription to the marketing, so this is the one that
+     actually matters. Refusing here is what stops a device that never saw the
+     gate — a script, a stale app, a curious developer — from signing itself up
+     for alcohol alerts. */
+  if (!oldEnough(device, shop))
+    return fail(c, 403, "confirm your age before following this shop");
 
   /* Only aisles this shop actually has — a typo must not become a silent
      subscription to nothing. */
@@ -330,7 +430,8 @@ app.delete("/v1/shops/:slug/follow", async (c) => {
 app.get("/v1/me/follows", async (c) => {
   const device = await need(c);
   const rows = await sql`
-    select s.slug, s.name, s.address, s.town, s.daily_cap, f.aisles, f.muted
+    select s.slug, s.name, s.address, s.town, s.zip, s.hours, s.daily_cap,
+           s.min_age, f.aisles, f.muted
       from follows f join shops s on s.id = f.shop_id
      where f.device_id = ${device.id} order by s.name`;
   return c.json({ follows: rows });
@@ -346,6 +447,12 @@ app.get("/v1/me/feed", async (c) => {
       join shops s on s.id = p.shop_id
      where p.status = 'active'
        and (p.kind in ('hours','notice') or p.aisle = any (f.aisles))
+       /* An age-restricted shop's posts only appear once this device has
+          cleared that shop's bar. A follow made before the gate existed, or a
+          bar a shop raises later, both land on the right side of this. */
+       and (s.min_age is null
+            or (${device.age_ok_to ?? null}::smallint is not null
+                and ${device.age_ok_to ?? null}::smallint >= s.min_age))
      order by p.created_at desc limit 50`;
   return c.json({ posts: rows });
 });
@@ -411,6 +518,71 @@ app.post("/v1/auth/verify", async (c) => {
                   claimed: invites.length });
 });
 
+/* ---------------------------------------------------------------- review ---
+ * Signing in without an inbox.
+ *
+ * Owner access is a link emailed to the address on the invitation, which works
+ * for a shopkeeper and not at all for the person at Apple who has to open this
+ * app and try everything in it before it can go on the App Store. They have no
+ * inbox of ours, so the email road is a dead end and the app is rejected as
+ * unreviewable — one of the most common reasons a first submission fails.
+ *
+ * This is the standard answer: ONE account that signs in with a fixed code,
+ * handed to Apple in the review notes. It is deliberately narrow.
+ *
+ *   - Dead unless BOTH env vars are set. No env, no route.
+ *   - One address only, the one named in REVIEW_EMAIL.
+ *   - The code is compared in constant time, so it cannot be guessed by
+ *     timing the answer.
+ *   - It grants nothing on its own. The account holds exactly the shops it was
+ *     invited to, through the same invite rows as everyone else — so invite it
+ *     to a demo shop and it can never touch a real one.
+ * ------------------------------------------------------------------------- */
+
+const REVIEW_EMAIL = (process.env.REVIEW_EMAIL || "").trim().toLowerCase();
+const REVIEW_CODE  = process.env.REVIEW_CODE || "";
+export const reviewSignInEnabled = Boolean(REVIEW_EMAIL && REVIEW_CODE);
+
+app.post("/v1/auth/code", async (c) => {
+  if (!reviewSignInEnabled) return fail(c, 404, "not found");
+  const b = parse(z.object({
+    email: z.string().email(),
+    code: z.string().min(8).max(100),
+  }), await c.req.json());
+
+  const emailOk = b.email.trim().toLowerCase() === REVIEW_EMAIL;
+  /* Both sides padded to the same length first: timingSafeEqual throws on a
+     length mismatch, and the throw itself would leak the code's length. */
+  const a = Buffer.from(b.code.padEnd(128).slice(0, 128));
+  const z2 = Buffer.from(REVIEW_CODE.padEnd(128).slice(0, 128));
+  const codeOk = timingSafeEqual(a, z2);
+  if (!emailOk || !codeOk) return fail(c, 401, "that code is not right");
+
+  const [owner] = await sql`
+    insert into owners (email) values (${REVIEW_EMAIL})
+    on conflict (email) do update set email = excluded.email returning *`;
+
+  /* Same invite-to-membership step as the emailed link. There is no other way
+     to come to hold a shop, here included. */
+  const invites = await sql`
+    select * from invites where email = ${REVIEW_EMAIL}
+      and accepted_at is null and expires_at > now()`;
+  for (const inv of invites) {
+    await sql`insert into memberships (owner_id, shop_id, role)
+              values (${owner.id}, ${inv.shop_id}, ${inv.role})
+              on conflict do nothing`;
+    await sql`update invites set accepted_at = now(), accepted_by = ${owner.id}
+               where token = ${inv.token}`;
+  }
+
+  const session = newToken();
+  /* Short, unlike a shopkeeper's 60 days: a review takes a day. */
+  await sql`insert into sessions (token, owner_id, expires_at)
+            values (${store(session)}, ${owner.id}, now() + interval '7 days')`;
+  return c.json({ token: session, owner: { id: owner.id, email: owner.email },
+                  claimed: invites.length });
+});
+
 const needOwner = async (c) => {
   const o = await ownerFrom(c);
   if (!o) throw Object.assign(new Error("sign in first"), { status: 401 });
@@ -428,7 +600,7 @@ app.get("/v1/owner/shops", async (c) => {
   const owner = await needOwner(c);
   const rows = await sql`
     select s.slug, s.name, s.address, s.town, s.zip, s.hours, s.lat, s.lon,
-           s.daily_cap, m.role,
+           s.daily_cap, s.min_age, m.role,
            coalesce((select array_agg(a.aisle order by a.position, a.aisle)
                        from shop_aisles a where a.shop_id = s.id), '{}') as aisles
       from memberships m join shops s on s.id = m.shop_id
@@ -521,6 +693,10 @@ const ShopIn = z.object({
   hours: z.string().max(80).optional(),
   daily_cap: z.number().int().min(1).max(10).default(3),
   aisles: z.array(z.string().max(40)).min(1).max(20),
+  /* 21 for a liquor store. Null for everyone else. Set at creation because a
+     shop that sells alcohol does so from its first post, not from whenever
+     someone remembers to tick a box. */
+  min_age: z.number().int().min(13).max(25).nullable().optional(),
 });
 
 app.post("/v1/admin/shops", async (c) => {
@@ -529,7 +705,8 @@ app.post("/v1/admin/shops", async (c) => {
   const [shop] = await sql`
     insert into shops ${sql({
       slug: b.slug, name: b.name, address: b.address, town: b.town,
-      zip: b.zip, hours: b.hours ?? null, daily_cap: b.daily_cap })}
+      zip: b.zip, hours: b.hours ?? null, daily_cap: b.daily_cap,
+      min_age: b.min_age ?? null })}
     returning *`;
   await sql`insert into shop_aisles ${sql(
     b.aisles.map((aisle, position) => ({ shop_id: shop.id, aisle, position })))}`;

@@ -315,3 +315,97 @@ language sql stable as $$
     left join devices d on d.id = f.device_id
    where f.shop_id = p_shop_id
 $$;
+
+-- ============================================================================
+-- Age-restricted shops.
+--
+-- A liquor store's alerts are alcohol marketing, and both app stores require a
+-- gate in front of them. The gate is an attestation, not an identity check —
+-- which is what the stores ask for and all any consumer app can honestly do.
+--
+-- What matters here is where the date of birth lives: ON THE PHONE, and
+-- nowhere else. The phone works out whether it clears the bar and sends only
+-- the bar it cleared. The server never receives a birth date, so there is no
+-- date of birth in this database to leak, to subpoena, or to explain to a shop
+-- owner. `age_ok_to` is the highest minimum age this device has attested to.
+-- ============================================================================
+
+alter table shops
+  add column if not exists min_age smallint
+    check (min_age is null or min_age between 13 and 25);
+
+alter table devices add column if not exists age_ok_to smallint;
+alter table devices add column if not exists age_ok_at timestamptz;
+
+-- The reason has to be recordable, or an alert withheld for age would violate
+-- the deliveries constraint and take the whole fan-out down with it.
+alter table deliveries drop constraint if exists deliveries_withheld_check;
+alter table deliveries add constraint deliveries_withheld_check
+  check (withheld is null or withheld in
+    ('aisle_off','daily_cap','muted','no_device','duplicate','age_unverified'));
+
+-- A follower who has not cleared the shop's age bar is never sent to, even if
+-- a row somehow exists. The gate in the app is the door; this is the lock.
+create or replace function recipients_for(p_post_id uuid)
+returns table (device_id uuid, withheld text)
+language sql stable as $$
+  with p as (
+    select po.*, s.daily_cap, s.min_age
+      from posts po join shops s on s.id = po.shop_id
+     where po.id = p_post_id
+  )
+  select f.device_id,
+         case
+           when f.muted then 'muted'
+           when p.min_age is not null
+                and (d.age_ok_to is null or d.age_ok_to < p.min_age)
+             then 'age_unverified'
+           when d.id is null or d.retired_at is not null or d.endpoint is null
+             then 'no_device'
+           when p.kind in ('sale','arrival') and not (p.aisle = any (f.aisles))
+             then 'aisle_off'
+           when (select count(*) from deliveries dl
+                  where dl.device_id = f.device_id
+                    and dl.shop_id   = p.shop_id
+                    and dl.withheld is null
+                    and dl.sent_at > now() - interval '24 hours') >= p.daily_cap
+             then 'daily_cap'
+           else null
+         end as withheld
+    from p
+    join follows f on f.shop_id = p.shop_id
+    left join devices d on d.id = f.device_id and d.retired_at is null
+$$;
+
+-- An unverified follower of an age-restricted shop is not reach. Counting them
+-- would charge the shop for people the server will never send to.
+create or replace function reach_for(p_shop_id uuid)
+returns table (total bigint, muted bigint, no_push bigint, reachable bigint)
+language sql stable as $$
+  with s as (select min_age from shops where id = p_shop_id),
+  ok as (
+    select f.muted,
+           d.id is not null and d.retired_at is null and d.endpoint is not null
+             as has_push,
+           (select min_age from s) is null
+             or (d.age_ok_to is not null
+                 and d.age_ok_to >= (select min_age from s))  as old_enough
+      from follows f
+      left join devices d on d.id = f.device_id
+     where f.shop_id = p_shop_id
+  )
+  select count(*)                                                   as total,
+         count(*) filter (where muted)                              as muted,
+         count(*) filter (where not muted
+                            and (not has_push or not old_enough))   as no_push,
+         count(*) filter (where not muted and has_push
+                            and old_enough)                         as reachable
+    from ok
+$$;
+
+-- Which of Apple's two push services this device's token belongs to. Learned
+-- on first send rather than configured: a developer testing from Xcode and a
+-- customer who installed from the App Store are on different services at the
+-- same time, which no single setting can express. Null until established.
+alter table devices add column if not exists push_env text
+  check (push_env is null or push_env in ('production','sandbox'));

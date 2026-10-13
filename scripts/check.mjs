@@ -20,6 +20,10 @@ if (!api) {
 let bad = 0;
 const yes = (s) => console.log(`  ok    ${s}`);
 const no = (s, fix) => { bad++; console.log(`  FAIL  ${s}\n        → ${fix}`); };
+/* Not yet done is not the same as broken. The native routes are unset until
+   there is an app in a store, and failing the whole check over that would
+   teach you to ignore it. */
+const note = (s, fix) => console.log(`  --    ${s}\n        → ${fix}`);
 
 const get = async (url, opts) => {
   try {
@@ -42,6 +46,17 @@ if (h.status === 0) {
   if (h.body?.db) yes("it can reach the database");
   else no("it cannot reach the database",
           "Check DATABASE_URL. A managed Postgres needs TLS; a wrong password gives this too.");
+
+  /* Each native route is reported separately, because a half-configured
+     deployment is the dangerous state: the app installs, people follow, and
+     only the phones on the route you forgot hear nothing. */
+  const b = h.body?.push_backends || {};
+  if (b.apns) yes(`Apple push is configured (${b.apns_env})`);
+  else note("Apple push is off — iPhone App Store followers will hear nothing",
+            "Set APNS_KEY_ID, APNS_TEAM_ID and APNS_KEY_P8. Only needed once the iPhone app ships.");
+  if (b.fcm) yes(`Android push is configured (${b.fcm_project})`);
+  else note("Android push is off — Play Store followers will hear nothing",
+            "Paste the Firebase service-account JSON into FCM_SERVICE_ACCOUNT. Only needed once the Android app ships.");
 
   if (h.body?.push) yes("push is configured");
   else no("push is NOT configured — no alert can ever be delivered",
