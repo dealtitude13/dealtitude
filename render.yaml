@@ -37,9 +37,9 @@ services:
       # Where the app lives. Sign-in links are built from this, so a wrong
       # value produces links that land nowhere.
       - key: APP_URL
-        value: https://dealtitude.com
+        value: https://bespoke-syrniki-dd8e0d.netlify.app
       - key: ALLOWED_ORIGINS
-        value: https://dealtitude.com,https://www.dealtitude.com
+        value: https://bespoke-syrniki-dd8e0d.netlify.app,https://dealtitude.com
 
       # Operator key for the admin routes. Long and random.
       - key: ADMIN_KEY
