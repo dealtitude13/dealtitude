@@ -14,7 +14,11 @@ import { sendSignInLink, mailConfigured } from "./mail.js";
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-14b";
+const BUILD = "2026-10-14c";
+
+/* Deliberately not just "is this not production": a pilot IS production here.
+   It has to be switched on by hand and switched off again. */
+const resetAllowed = String(process.env.ALLOW_RESET || "").toLowerCase() === "true";
 
 const app = new Hono();
 
@@ -103,6 +107,10 @@ app.get("/v1/health", async (c) => {
        refused, and the app can only report that as "wrong key" — which sends
        you checking the key you typed instead of the one that is missing. */
     admin_key: adminKeySet(),
+    /* Whether the start-fresh route is open. Shown so the app can offer it
+       only when it exists, and so you can see at a glance that you left it
+       switched on. */
+    reset_enabled: resetAllowed,
     app_url: process.env.APP_URL || null,
     origins: allowedOrigins,
     /* Two builds, because "is my change live?" was the hardest question to
@@ -565,6 +573,27 @@ const REVIEW_EMAILS = (process.env.REVIEW_EMAIL || process.env.REVIEW_EMAILS || 
 const REVIEW_CODE  = process.env.REVIEW_CODE || "";
 export const reviewSignInEnabled = Boolean(REVIEW_EMAILS.length && REVIEW_CODE);
 
+/* Turning every invite addressed to this owner into a membership.
+ *
+ * Shared by signing in and by /v1/owner/claim, because an invite that only
+ * takes effect on the NEXT sign-in is a trap: the operator adds a shop with
+ * their own address on it, the screen stays empty, and nothing on it suggests
+ * signing out is what's needed. Only invites written to this owner's own
+ * address are ever accepted, so it grants nothing that a sign-in would not. */
+async function claimInvites(owner) {
+  const invites = await sql`
+    select * from invites where email = ${owner.email}
+      and accepted_at is null and expires_at > now()`;
+  for (const inv of invites) {
+    await sql`insert into memberships (owner_id, shop_id, role)
+              values (${owner.id}, ${inv.shop_id}, ${inv.role})
+              on conflict do nothing`;
+    await sql`update invites set accepted_at = now(), accepted_by = ${owner.id}
+               where token = ${inv.token}`;
+  }
+  return invites;
+}
+
 app.post("/v1/auth/code", async (c) => {
   if (!reviewSignInEnabled) return fail(c, 404, "not found");
   const b = parse(z.object({
@@ -589,16 +618,7 @@ app.post("/v1/auth/code", async (c) => {
 
   /* Same invite-to-membership step as the emailed link. There is no other way
      to come to hold a shop, here included. */
-  const invites = await sql`
-    select * from invites where email = ${email}
-      and accepted_at is null and expires_at > now()`;
-  for (const inv of invites) {
-    await sql`insert into memberships (owner_id, shop_id, role)
-              values (${owner.id}, ${inv.shop_id}, ${inv.role})
-              on conflict do nothing`;
-    await sql`update invites set accepted_at = now(), accepted_by = ${owner.id}
-               where token = ${inv.token}`;
-  }
+  const invites = await claimInvites(owner);
 
   const session = newToken();
   /* Short, unlike a shopkeeper's 60 days: a review takes a day. */
@@ -621,6 +641,14 @@ const needShop = async (c, owner) => {
   return shop;
 };
 
+/* Pick up any shop invited to this address since signing in, without having
+   to sign in again. */
+app.post("/v1/owner/claim", async (c) => {
+  const owner = await needOwner(c);
+  const claimed = await claimInvites(owner);
+  return c.json({ claimed: claimed.length });
+});
+
 app.get("/v1/owner/shops", async (c) => {
   const owner = await needOwner(c);
   const rows = await sql`
@@ -629,7 +657,7 @@ app.get("/v1/owner/shops", async (c) => {
            coalesce((select array_agg(a.aisle order by a.position, a.aisle)
                        from shop_aisles a where a.shop_id = s.id), '{}') as aisles
       from memberships m join shops s on s.id = m.shop_id
-     where m.owner_id = ${owner.id} order by s.name`;
+     where m.owner_id = ${owner.id} and s.active order by s.name`;
   /* Say who is asking. A client restoring a 60-day session has the token but
      not the address it belongs to, and it should not have to keep its own copy
      of that — this is the answer the server already knows. */
@@ -722,6 +750,31 @@ const ShopIn = z.object({
      shop that sells alcohol does so from its first post, not from whenever
      someone remembers to tick a box. */
   min_age: z.number().int().min(13).max(25).nullable().optional(),
+});
+
+/* Wiping everything, for a pilot that has gone round in circles.
+ *
+ * Two keys are needed, not one: the operator key AND an ALLOW_RESET flag in
+ * the server's own settings. The key alone is not enough, because a key is a
+ * string that gets pasted into phones and read off screens, and the blast
+ * radius here is the whole business. The flag is turned on deliberately, used,
+ * and turned off — so for all but a few minutes of its life, this route
+ * answers 404 to everyone including its author.
+ *
+ * It truncates rather than drops: the schema, and so the shape of the thing,
+ * is never at risk. */
+app.post("/v1/admin/reset", async (c) => {
+  if (!resetAllowed) return fail(c, 404, "not found");
+  guard(c);
+  /* The caller has to name what it is destroying. A reset that fires on an
+     empty body is one stray request away from happening by accident. */
+  const b = parse(z.object({ confirm: z.literal("RESET") }), await c.req.json());
+  await sql`truncate
+    shops, shop_aisles, devices, follows, posts, deliveries, owners,
+    memberships, invites, login_links, sessions, catalog, device_claims
+    restart identity cascade`;
+  console.warn("[dealtitude] everything was reset on purpose:", b.confirm);
+  return c.json({ reset: true });
 });
 
 app.post("/v1/admin/shops", async (c) => {
