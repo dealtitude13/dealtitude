@@ -539,9 +539,18 @@ app.post("/v1/auth/verify", async (c) => {
  *     to a demo shop and it can never touch a real one.
  * ------------------------------------------------------------------------- */
 
-const REVIEW_EMAIL = (process.env.REVIEW_EMAIL || "").trim().toLowerCase();
+/* One or more addresses, comma separated. More than one because the person
+   who built this needs to sign in on a shop floor with no inbox to hand just
+   as much as a reviewer does, and sharing one address between them would mean
+   Apple signing in as the real operator. */
+/* Either spelling works. The value is a LIST, so the plural is the natural
+   guess when typing it into a hosting dashboard — and getting it wrong fails
+   as "that code is not right", which sends you looking at the code instead of
+   the variable name. */
+const REVIEW_EMAILS = (process.env.REVIEW_EMAIL || process.env.REVIEW_EMAILS || "")
+  .split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
 const REVIEW_CODE  = process.env.REVIEW_CODE || "";
-export const reviewSignInEnabled = Boolean(REVIEW_EMAIL && REVIEW_CODE);
+export const reviewSignInEnabled = Boolean(REVIEW_EMAILS.length && REVIEW_CODE);
 
 app.post("/v1/auth/code", async (c) => {
   if (!reviewSignInEnabled) return fail(c, 404, "not found");
@@ -550,7 +559,8 @@ app.post("/v1/auth/code", async (c) => {
     code: z.string().min(8).max(100),
   }), await c.req.json());
 
-  const emailOk = b.email.trim().toLowerCase() === REVIEW_EMAIL;
+  const email = b.email.trim().toLowerCase();
+  const emailOk = REVIEW_EMAILS.includes(email);
   /* Both sides padded to the same length first: timingSafeEqual throws on a
      length mismatch, and the throw itself would leak the code's length. */
   const a = Buffer.from(b.code.padEnd(128).slice(0, 128));
@@ -558,14 +568,16 @@ app.post("/v1/auth/code", async (c) => {
   const codeOk = timingSafeEqual(a, z2);
   if (!emailOk || !codeOk) return fail(c, 401, "that code is not right");
 
+  /* Only an address on the list reaches this line, so it is safe to sign in
+     as whichever one was asked for. */
   const [owner] = await sql`
-    insert into owners (email) values (${REVIEW_EMAIL})
+    insert into owners (email) values (${email})
     on conflict (email) do update set email = excluded.email returning *`;
 
   /* Same invite-to-membership step as the emailed link. There is no other way
      to come to hold a shop, here included. */
   const invites = await sql`
-    select * from invites where email = ${REVIEW_EMAIL}
+    select * from invites where email = ${email}
       and accepted_at is null and expires_at > now()`;
   for (const inv of invites) {
     await sql`insert into memberships (owner_id, shop_id, role)
@@ -711,6 +723,21 @@ app.post("/v1/admin/shops", async (c) => {
   await sql`insert into shop_aisles ${sql(
     b.aisles.map((aisle, position) => ({ shop_id: shop.id, aisle, position })))}`;
   return c.json({ shop }, 201);
+});
+
+/* Taking a shop down.
+ *
+ * Deactivating rather than deleting: a shop's posts, its followers and the
+ * record of what was delivered are the only evidence of what actually happened
+ * during the pilot, and a mistyped name at a counter should not be able to
+ * destroy it. Deactivated shops vanish from every shopper-facing route, which
+ * is the thing that was actually wanted. */
+app.delete("/v1/admin/shops/:slug", async (c) => {
+  guard(c);
+  const [shop] = await sql`
+    update shops set active = false where slug = ${c.req.param("slug")} returning slug, name`;
+  if (!shop) return fail(c, 404, "no such shop");
+  return c.json({ removed: shop.slug, name: shop.name });
 });
 
 app.post("/v1/admin/invites", async (c) => {
