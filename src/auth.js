@@ -58,7 +58,14 @@ export async function holdsShop(ownerId, shopId) {
 
 /** Operator key, for creating shops and issuing invites. Not a user role. */
 export function isAdmin(c) {
-  const key = c.req.header("x-admin-key");
-  const want = process.env.ADMIN_KEY;
+  /* Both sides trimmed. A value pasted into a hosting dashboard picks up a
+     trailing newline often enough, and the symptom — every correct key
+     refused — looks nothing like its cause. */
+  const key = (c.req.header("x-admin-key") || "").trim();
+  const want = (process.env.ADMIN_KEY || "").trim();
   return Boolean(want && key && safeEqual(key, want));
 }
+
+/** Is an operator key configured at all? Without one, every key is refused,
+    which is indistinguishable from a wrong key unless we say so. */
+export const adminKeySet = () => Boolean((process.env.ADMIN_KEY || "").trim());

@@ -7,9 +7,14 @@ import { sql, healthy } from "./db.js";
 import { publish } from "./publish.js";
 import { publicKey, pushConfigured, backends } from "./push.js";
 import {
-  newToken, store, deviceFrom, ownerFrom, holdsShop, isAdmin,
+  newToken, store, deviceFrom, ownerFrom, holdsShop, isAdmin, adminKeySet,
 } from "./auth.js";
 import { sendSignInLink, mailConfigured } from "./mail.js";
+
+/* Bumped by hand with each handoff, and reported by /v1/health. The app shows
+   the same stamp on its first screen, so one look at each says whether the two
+   halves actually match. */
+const BUILD = "2026-10-14b";
 
 const app = new Hono();
 
@@ -94,9 +99,17 @@ app.get("/v1/health", async (c) => {
     /* Whether the App Store reviewer can get in. Worth seeing at a glance:
        its absence is only discovered through a rejection, days later. */
     review_sign_in: reviewSignInEnabled,
+    /* Whether an operator key exists at all. Without one every key is
+       refused, and the app can only report that as "wrong key" — which sends
+       you checking the key you typed instead of the one that is missing. */
+    admin_key: adminKeySet(),
     app_url: process.env.APP_URL || null,
     origins: allowedOrigins,
-    build: process.env.RENDER_GIT_COMMIT?.slice(0, 7) || null,
+    /* Two builds, because "is my change live?" was the hardest question to
+       answer all week. BUILD is written by hand and matches the app's stamp;
+       commit is whatever the host happened to deploy. */
+    build: BUILD,
+    commit: process.env.RENDER_GIT_COMMIT?.slice(0, 7) || null,
   }, db ? 200 : 503);
 });
 
