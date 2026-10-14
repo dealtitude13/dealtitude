@@ -12,6 +12,11 @@
  * ------------------------------------------------------------------------- */
 
 const KEY = process.env.RESEND_API_KEY;
+/* Overridable so the invite email can be tested against a stand-in provider
+   that records what arrived. Without this seam the only way to know whether an
+   invite sends anything is to send one to a real inbox and go and look — which
+   is why it went unnoticed that it sent nothing at all. */
+const ENDPOINT = process.env.RESEND_URL || "https://api.resend.com/emails";
 const FROM = process.env.MAIL_FROM || "Dealtitude <hello@dealtitude.com>";
 const REPLY_TO = process.env.MAIL_REPLY_TO || null;
 
@@ -71,7 +76,7 @@ export async function sendSignInLink(email, link, minutes = 20) {
 
   const { text, html } = signInBody(link, minutes);
   try {
-    const res = await fetch("https://api.resend.com/emails", {
+    const res = await fetch(ENDPOINT, {
       method: "POST",
       headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
       body: JSON.stringify({
@@ -91,5 +96,95 @@ export async function sendSignInLink(email, link, minutes = 20) {
     console.error("[mail] send threw", e.message);
     console.log(`[auth] sign-in link for ${email}: ${link}`);
     return { sent: false, reason: "network" };
+  }
+}
+
+/* ----------------------------------------------------------------- invites --
+ * The email an owner actually receives first.
+ *
+ * Separate wording from the sign-in link, because the situations are not the
+ * same: a sign-in link is something you asked for seconds ago, an invite
+ * arrives unprompted and has to say who set this up and what it is before it
+ * asks anyone to tap anything. A shopkeeper who cannot tell it from phishing
+ * will not tap it, and that is the whole business stalled at the first step.
+ */
+function inviteBody(link, shopName, days) {
+  const text = [
+    `${shopName} has been set up on Dealtitude.`,
+    "",
+    "Dealtitude lets you tell the customers who follow your shop when you have",
+    "something on — a sale, a delivery just in, a change of hours. They choose",
+    "which aisles they care about, and you can only reach them a few times a day.",
+    "",
+    "Open your shop here:",
+    link,
+    "",
+    `This link is yours alone and works for ${days} days.`,
+    "If you weren't expecting this, you can ignore it — nothing has been shared.",
+  ].join("\n");
+
+  const html = `<!doctype html><html><body style="margin:0;padding:24px;
+  background:#F5EFE4;font-family:Helvetica,Arial,sans-serif;color:#1A1410">
+  <div style="max-width:440px;margin:0 auto;background:#FFFDF8;border-radius:14px;
+    padding:28px 24px;border:1px solid #DED3C2">
+    <div style="font-size:13px;font-weight:700;letter-spacing:.08em;color:#7A6E62;
+      text-transform:uppercase">Dealtitude</div>
+    <div style="font-size:21px;font-weight:800;margin:14px 0 8px;letter-spacing:-.02em">
+      ${shopName} is ready</div>
+    <div style="font-size:15px;line-height:1.5;margin-bottom:18px">
+      Tell the customers who follow your shop when you have something on — a
+      sale, a delivery just in, a change of hours. They pick the aisles they
+      care about, and you can only reach them a few times a day.</div>
+    <a href="${link}" style="display:inline-block;background:#FF9F1C;color:#1A1410;
+      text-decoration:none;font-weight:800;font-size:16px;padding:13px 22px;
+      border-radius:10px">Open my shop</a>
+    <div style="font-size:12.5px;line-height:1.55;color:#7A6E62;margin-top:22px">
+      If the button doesn't work, copy this address into your browser:<br>
+      <span style="word-break:break-all;color:#2E7D5B">${link}</span>
+    </div>
+    <div style="font-size:12.5px;line-height:1.55;color:#7A6E62;margin-top:18px;
+      padding-top:16px;border-top:1px solid #F2ECE1">
+      This link is yours alone and works for ${days} days. If you weren't
+      expecting it, ignore it — nothing has been shared.
+    </div>
+  </div></body></html>`;
+
+  return { text, html };
+}
+
+/**
+ * Send an owner their first way in. Same guarantees as the sign-in link:
+ * never throws, and says plainly whether it went.
+ */
+export async function sendInviteLink(email, link, shopName, days = 7) {
+  if (!KEY) {
+    console.log(`[invite] link for ${email} (${shopName}): ${link}`);
+    return { sent: false, reason: "no_mail_key" };
+  }
+  const { text, html } = inviteBody(link, shopName, days);
+  try {
+    const res = await fetch(ENDPOINT, {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        from: FROM, to: [email], subject: `${shopName} is ready on Dealtitude`,
+        text, html, ...(REPLY_TO ? { reply_to: REPLY_TO } : {}),
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.error("[mail] invite failed", res.status, body.slice(0, 300));
+      console.log(`[invite] link for ${email} (${shopName}): ${link}`);
+      /* The provider's own words, trimmed. "Domain not verified" and "key
+         rejected" need completely different fixes, and a bare status code
+         sends you looking in the wrong place. */
+      return { sent: false, reason: `resend_${res.status}`,
+               detail: body.slice(0, 200) };
+    }
+    return { sent: true };
+  } catch (e) {
+    console.error("[mail] invite threw", e.message);
+    console.log(`[invite] link for ${email} (${shopName}): ${link}`);
+    return { sent: false, reason: "network", detail: e.message };
   }
 }

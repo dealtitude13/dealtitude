@@ -9,12 +9,12 @@ import { publicKey, pushConfigured, backends } from "./push.js";
 import {
   newToken, store, deviceFrom, ownerFrom, holdsShop, isAdmin, adminKeySet,
 } from "./auth.js";
-import { sendSignInLink, mailConfigured } from "./mail.js";
+import { sendSignInLink, sendInviteLink, mailConfigured } from "./mail.js";
 
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-14c";
+const BUILD = "2026-10-14d";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -812,16 +812,46 @@ app.post("/v1/admin/invites", async (c) => {
     slug: z.string(), email: z.string().email(),
     role: z.enum(["owner", "staff"]).default("owner"),
   }), await c.req.json());
-  const [shop] = await sql`select id from shops where slug = ${b.slug}`;
+  /* The name as well as the id: it goes in the subject line of the first email
+     this shopkeeper ever gets from us, and "undefined is ready on Dealtitude"
+     is not a first impression you recover from. */
+  const [shop] = await sql`select id, name from shops where slug = ${b.slug}`;
   if (!shop) return fail(c, 404, "no such shop");
   const token = newToken();
   await sql`insert into invites (token, shop_id, email, role, expires_at)
             values (${store(token)}, ${shop.id}, ${b.email}, ${b.role},
                     now() + interval '14 days')`;
-  /* The invite is claimed by signing in with that address — the token is a
-     record, not a key someone else could use. */
-  return c.json({ invited: b.email, shop: b.slug,
-                  instructions: "they sign in with this email and the shop is theirs" }, 201);
+
+  /* And actually send it.
+   *
+   * This route used to create the row and return advice. Nothing reached the
+   * owner, and from the outside that is indistinguishable from mail being
+   * broken — the operator is told the invite was sent and the shopkeeper's
+   * inbox stays empty. An invite that is not delivered is not an invite.
+   *
+   * The link is a login link for that address, so opening it proves the
+   * address and claims the invite by the same path as any other sign-in. No
+   * new kind of credential, and nothing a forwarded copy could do that the
+   * address holder could not already do. */
+  const linkToken = newToken();
+  const DAYS = 7;
+  await sql`insert into login_links (token, email, expires_at)
+            values (${store(linkToken)}, ${b.email},
+                    now() + interval '7 days')`;
+  const link = `${process.env.APP_URL || ""}/owner?token=${linkToken}`;
+  const mail = await sendInviteLink(b.email, link, shop.name, DAYS);
+
+  /* The caller already holds the operator key and chose this address a moment
+     ago, so handing the link back when mail did not go grants them nothing —
+     and it is the difference between a pilot that continues and one that waits
+     on DNS. Never included when the mail actually went. */
+  return c.json({
+    invited: b.email, shop: b.slug, mail,
+    ...(mail.sent ? {} : { link }),
+    instructions: mail.sent
+      ? "they have been emailed a link to their shop"
+      : "mail is not sending — pass them this link yourself",
+  }, 201);
 });
 
 const port = Number(process.env.PORT || 8787);
