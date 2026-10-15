@@ -339,10 +339,15 @@ alter table devices add column if not exists age_ok_at timestamptz;
 
 -- The reason has to be recordable, or an alert withheld for age would violate
 -- the deliveries constraint and take the whole fan-out down with it.
+--
+-- Kept as one authoritative list rather than a narrow constraint that a later
+-- migration widens: schema.sql is re-applied in full, so the narrow step ran
+-- first against rows the widened step had already allowed, and failed.
 alter table deliveries drop constraint if exists deliveries_withheld_check;
 alter table deliveries add constraint deliveries_withheld_check
   check (withheld is null or withheld in
-    ('aisle_off','daily_cap','muted','no_device','duplicate','age_unverified'));
+    ('aisle_off','daily_cap','muted','no_device','duplicate','age_unverified',
+     'push_unconfigured','send_failed','gone'));
 
 -- A follower who has not cleared the shop's age bar is never sent to, even if
 -- a row somehow exists. The gate in the app is the door; this is the lock.
@@ -409,3 +414,107 @@ $$;
 -- same time, which no single setting can express. Null until established.
 alter table devices add column if not exists push_env text
   check (push_env is null or push_env in ('production','sandbox'));
+
+-- A send that fails after recipients_for() has cleared the follower is still a
+-- decision the shop is owed. Those were written here as 'no_device' and left
+-- out of the publish response altogether, so a shop with one eligible follower
+-- and no push keys configured was told "nobody follows this shop yet". Three
+-- of the reasons above are not the follower's problem and must never be worded
+-- as if they were: push_unconfigured is ours, send_failed is the push
+-- service's, and gone means the subscription died since they followed.
+
+-- ------------------------------------------------------------------ wants ----
+-- "Hoping for something else?" used to be the shop's own aisle list rendered a
+-- second time, with the overlap greyed out — the shopper picking from the same
+-- five chips twice on one screen. Worse, the tally lived in the app's own
+-- memory and never reached here, so the owner's "what shoppers asked for"
+-- panel was showing that one device its own taps back.
+--
+-- An aisle is not a want. A shopkeeper knows he sells sweets; what he cannot
+-- know is that six people are waiting for Kaju Katli. So a want is an ITEM, in
+-- the shopper's words, and it earns them something concrete in return: a
+-- standing alert for that one thing, which reaches them even if they never
+-- switched its aisle on. Aisles filter. Wants pull.
+create table if not exists wants (
+  id          uuid primary key default gen_random_uuid(),
+  shop_id     uuid not null references shops(id)   on delete cascade,
+  device_id   uuid not null references devices(id) on delete cascade,
+  label       text not null,          -- as typed, for display
+  norm        text not null,          -- for grouping and for matching posts
+  aisle       text,                   -- inferred where we can, never required
+  alert       boolean not null default true,
+  created_at  timestamptz not null default now(),
+  filled_at   timestamptz,            -- stamped when the shop posts a match
+  unique (shop_id, device_id, norm)
+);
+create index if not exists wants_shop_idx on wants (shop_id) where filled_at is null;
+create index if not exists wants_match_idx on wants (shop_id, norm) where alert;
+
+-- One normalisation rule, used by the unique index, the grouping and the
+-- post matching alike. Two shoppers typing "kaju katli" and "Kaju Katli!"
+-- are waiting for the same thing and must count as two, not as one each.
+create or replace function norm_item(t text) returns text
+language sql immutable as $$
+  select nullif(btrim(regexp_replace(lower(coalesce(t, '')),
+                                     '[^a-z0-9]+', ' ', 'g')), '')
+$$;
+
+-- What the shop is being asked for, most-wanted first. `label` is the most
+-- recent spelling, which is the one a shopper will recognise.
+create or replace function wants_for(p_shop_id uuid)
+returns table (norm text, label text, shoppers bigint, aisle text,
+               alerting bigint, last_at timestamptz)
+language sql stable as $$
+  select w.norm,
+         (array_agg(w.label order by w.created_at desc))[1]                  as label,
+         count(*)                                                           as shoppers,
+         (array_agg(w.aisle order by w.created_at desc)
+            filter (where w.aisle is not null))[1]                          as aisle,
+         count(*) filter (where w.alert)                                     as alerting,
+         max(w.created_at)                                                   as last_at
+    from wants w
+   where w.shop_id = p_shop_id and w.filled_at is null
+   group by w.norm
+   order by count(*) desc, max(w.created_at) desc
+$$;
+
+-- A follower who ASKED for this item is not "aisle off" — they are the single
+-- most interested person on the list. This one clause is what makes a want
+-- worth leaving: it outranks the aisle filter rather than restating it.
+create or replace function recipients_for(p_post_id uuid)
+returns table (device_id uuid, withheld text)
+language sql stable as $$
+  with p as (
+    select po.*, s.daily_cap, s.min_age
+      from posts po join shops s on s.id = po.shop_id
+     where po.id = p_post_id
+  )
+  select f.device_id,
+         case
+           when f.muted then 'muted'
+           when p.min_age is not null
+                and (d.age_ok_to is null or d.age_ok_to < p.min_age)
+             then 'age_unverified'
+           when d.id is null or d.retired_at is not null or d.endpoint is null
+             then 'no_device'
+           when p.kind in ('sale','arrival')
+                and not (p.aisle = any (f.aisles))
+                and not exists (
+                  select 1 from wants w
+                   where w.shop_id   = p.shop_id
+                     and w.device_id = f.device_id
+                     and w.alert
+                     and w.norm      = norm_item(p.name))
+             then 'aisle_off'
+           when (select count(*) from deliveries dl
+                  where dl.device_id = f.device_id
+                    and dl.shop_id   = p.shop_id
+                    and dl.withheld is null
+                    and dl.sent_at > now() - interval '24 hours') >= p.daily_cap
+             then 'daily_cap'
+           else null
+         end as withheld
+    from p
+    join follows f on f.shop_id = p.shop_id
+    left join devices d on d.id = f.device_id and d.retired_at is null
+$$;
