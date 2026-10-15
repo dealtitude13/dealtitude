@@ -14,7 +14,7 @@ import { sendSignInLink, sendInviteLink, mailConfigured } from "./mail.js";
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-14d";
+const BUILD = "2026-10-14e";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -504,7 +504,16 @@ app.post("/v1/auth/request", async (c) => {
      AND this is not production, so a pilot can run before the mail domain is
      verified without the link ever being exposed on a live server. */
   const showLink = !mailConfigured && process.env.NODE_ENV !== "production";
-  return c.json(showLink ? { sent: true, link } : { sent: true });
+
+  /* can_send says whether this server has a mail sender AT ALL. It is about
+     the server, not about the address, so it leaks nothing — and without it
+     the app can only say "check your inbox" to someone whose inbox will never
+     receive anything, which is the single most confusing thing it can say.
+
+     The link itself still never leaves a production server: handing one to
+     whoever types an address would be a way to sign in as any owner. */
+  return c.json({ sent: mail.sent, can_send: mailConfigured,
+                  ...(showLink ? { link } : {}) });
 });
 
 app.post("/v1/auth/verify", async (c) => {
