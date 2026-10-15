@@ -1,0 +1,19 @@
+# Dealtitude — hosting rules.
+#
+# One rule, on purpose. Every path serves the app, and the app asks the server
+# which shop the path names. So a new shop's counter card works the moment the
+# shop exists in the database — no rewrite rule to add here, no redeploy, and
+# no chance of a printed card pointing at a line somebody forgot to write.
+#
+# The 200 matters: it serves index.html at the URL the visitor typed, so the
+# path is still readable by the app. A 301 or 302 would throw the shop name
+# away before the app ever saw it, and every printed card would land on the
+# ZIP screen.
+
+# These two come FIRST, because the catch-all below would otherwise swallow
+# them and serve the app instead. Apple requires a working privacy policy URL
+# and a working support URL, and both are checked by a person.
+/privacy    /privacy.html   200
+/support    /support.html   200
+
+/*    /index.html   200

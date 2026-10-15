@@ -1,0 +1,6 @@
+{
+  "//": "One rewrite: every path serves the app, which asks the server which shop the path names. A new shop's card works with no redeploy.",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}

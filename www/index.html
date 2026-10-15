@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+<title>Dealtitude</title>
+<meta name="description" content="Shops announce. Shoppers listen." />
+
+<!-- home-screen install (web deploy only; the store builds ignore this) -->
+<link rel="manifest" href="manifest.webmanifest" />
+<meta name="theme-color" content="#F5EFE4" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="Dealtitude" />
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+<link rel="icon" href="icons/icon-192.png" />
+
+<style>
+  /* The typeface ships with the app. A store build must never wait on a CDN
+     to render its first screen, and it has to look right with no signal. */
+  @font-face { font-family: "Archivo"; font-style: normal; font-weight: 400;
+    font-display: swap; src: url("fonts/archivo-400.woff2") format("woff2"); }
+  @font-face { font-family: "Archivo"; font-style: normal; font-weight: 500;
+    font-display: swap; src: url("fonts/archivo-500.woff2") format("woff2"); }
+  @font-face { font-family: "Archivo"; font-style: normal; font-weight: 700;
+    font-display: swap; src: url("fonts/archivo-700.woff2") format("woff2"); }
+  @font-face { font-family: "Archivo"; font-style: normal; font-weight: 800;
+    font-display: swap; src: url("fonts/archivo-800.woff2") format("woff2"); }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; background: #F5EFE4; overscroll-behavior: none;
+    height: 100%; }
+  body { font-family: "Archivo", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    /* no text selection or callout on a native build — a web page gives itself
+       away the moment a long press selects a heading */
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  input, textarea { -webkit-user-select: text; user-select: text; }
+  input { outline: none; font-size: 16px; }
+  button:focus-visible, input:focus-visible { outline: 2px solid #2E7D5B; outline-offset: 2px; }
+  @keyframes scanline { 0% { top: 6%; } 100% { top: 92%; } }
+  @keyframes foundpop { 0% { transform: scale(.94); opacity: 0; }
+                        60% { transform: scale(1.03); opacity: 1; }
+                        100% { transform: scale(1); opacity: 1; } }
+  @keyframes sweep { 0%,100% { transform: translateY(-42px); } 50% { transform: translateY(42px); } }
+  @keyframes drop { from { transform: translateY(-70px); opacity: 0; } to { transform: none; opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-thumb { background: rgba(122,110,98,.32); border-radius: 99px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<!-- Must load before the bundle: it names the server. Never cached hard, so
+     pointing the app at a new API is a file edit, not a redeploy. -->
+<script src="config.js"></script>
+<script src="app.js"></script>
+<script>
+  /* The service worker is for the web deploy. Capacitor serves the app from
+     its own local server, where an SW adds nothing and can hold a stale copy. */
+  if ("serviceWorker" in navigator && !window.Capacitor?.isNativePlatform?.()) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("sw.js").catch(function () {});
+    });
+  }
+</script>
+</body>
+</html>
