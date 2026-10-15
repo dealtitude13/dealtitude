@@ -15,7 +15,7 @@ import { sendSignInLink, sendInviteLink, mailConfigured } from "./mail.js";
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-14h";
+const BUILD = "2026-10-15a";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -243,7 +243,7 @@ app.post("/v1/device/claim", async (c) => {
   const follows = await sql`
     select s.slug, s.name, f.aisles, f.muted
       from follows f join shops s on s.id = f.shop_id
-     where f.device_id = ${claim.device_id}`;
+     where f.device_id = ${claim.device_id} and s.active`;
   return c.json({ device_id: claim.device_id, token, follows });
 });
 
@@ -486,7 +486,12 @@ const PatchIn = z.object({
 app.patch("/v1/shops/:slug/follow", async (c) => {
   const device = await need(c);
   const b = parse(PatchIn, await c.req.json());
-  const [shop] = await sql`select id from shops where slug = ${c.req.param("slug")}`;
+  /* Filtered on active: a shop taken off the app cannot be followed. Without
+     it the Follow button worked on a shop that no longer existed, the follow
+     was recorded, and the next screen said "no such shop" — the app arguing
+     with itself in front of the person using it. */
+  const [shop] = await sql`
+    select id from shops where slug = ${c.req.param("slug")} and active`;
   if (!shop) return fail(c, 404, "no such shop");
 
   if (b.aisles) {
@@ -508,6 +513,8 @@ app.patch("/v1/shops/:slug/follow", async (c) => {
 
 app.delete("/v1/shops/:slug/follow", async (c) => {
   const device = await need(c);
+  /* NOT filtered on active, on purpose: unfollowing is how a phone tidies up
+     after a shop that has gone, and refusing it would strand the row. */
   const [shop] = await sql`select id from shops where slug = ${c.req.param("slug")}`;
   if (!shop) return fail(c, 404, "no such shop");
   await sql`delete from follows where device_id = ${device.id} and shop_id = ${shop.id}`;
@@ -520,7 +527,7 @@ app.get("/v1/me/follows", async (c) => {
     select s.slug, s.name, s.address, s.town, s.zip, s.hours, s.daily_cap,
            s.min_age, f.aisles, f.muted
       from follows f join shops s on s.id = f.shop_id
-     where f.device_id = ${device.id} order by s.name`;
+     where f.device_id = ${device.id} and s.active order by s.name`;
   return c.json({ follows: rows });
 });
 
@@ -531,7 +538,11 @@ app.get("/v1/me/feed", async (c) => {
            p.ends, p.created_at, s.slug, s.name as shop_name
       from posts p
       join follows f on f.shop_id = p.shop_id and f.device_id = ${device.id}
-      join shops s on s.id = p.shop_id
+      /* Joined on active: a shop taken off the app stops reaching the phones
+         that follow it, feed included. Its posts are kept, so a restore brings
+         them back. Backticks are deliberately absent from this comment — it
+         sits inside a template literal, where one would end the query. */
+      join shops s on s.id = p.shop_id and s.active
      where p.status = 'active'
        and (p.kind in ('hours','notice') or p.aisle = any (f.aisles))
        /* An age-restricted shop's posts only appear once this device has
@@ -709,7 +720,10 @@ const needOwner = async (c) => {
   return o;
 };
 const needShop = async (c, owner) => {
-  const [shop] = await sql`select * from shops where slug = ${c.req.param("slug")}`;
+  /* Filtered on active here too: an owner whose shop was taken down must not
+     read its reach or list its posts, any more than they can post to it. */
+  const [shop] = await sql`
+    select * from shops where slug = ${c.req.param("slug")} and active`;
   if (!shop) throw Object.assign(new Error("no such shop"), { status: 404 });
   if (!(await holdsShop(owner.id, shop.id)))
     throw Object.assign(new Error("that is not your shop"), { status: 403 });
