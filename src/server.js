@@ -4,6 +4,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
 import { sql, healthy } from "./db.js";
+import { zipPoint, milesBetween, knownZip } from "./geo.js";
 import { publish } from "./publish.js";
 import { publicKey, pushConfigured, backends } from "./push.js";
 import {
@@ -14,7 +15,7 @@ import { sendSignInLink, sendInviteLink, mailConfigured } from "./mail.js";
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-14f";
+const BUILD = "2026-10-14h";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -340,16 +341,81 @@ const oldEnough = (device, shop) =>
 const shopShape = sql`
   s.id, s.slug, s.name, s.address, s.town, s.zip, s.hours, s.daily_cap, s.min_age`;
 
+/* Shops near a ZIP, by actual distance.
+ *
+ * This used to return every shop whose zip column matched the string typed in,
+ * and the app drew a distance from an invented coordinate system — so a shop
+ * 42 miles away could be listed as "within five miles" the moment anything
+ * else put it on the screen. Distance is now computed here, from Census ZCTA
+ * centroids, and a shop with no coordinates is never given one.
+ *
+ * radius is in miles, defaults to 5, and is capped so this cannot be turned
+ * into "every shop in the country" by editing a URL. */
 app.get("/v1/shops", async (c) => {
   const zip = (c.req.query("zip") || "").trim();
   if (!/^\d{5}$/.test(zip)) return fail(c, 400, "a 5-digit zip is required");
+
+  const here = zipPoint(zip);
+  if (!here) return fail(c, 404, "that zip code isn't one we can place on a map");
+
+  const asked = Number(c.req.query("radius"));
+  const radius = Number.isFinite(asked) ? Math.min(Math.max(asked, 1), 50) : 5;
+
   const rows = await sql`
-    select ${shopShape},
+    select ${shopShape}, s.lat, s.lon,
            coalesce((select array_agg(a.aisle order by a.position, a.aisle)
                        from shop_aisles a where a.shop_id = s.id), '{}') as aisles,
            (select count(*) from follows f where f.shop_id = s.id) as followers
-      from shops s where s.zip = ${zip} and s.active order by s.name`;
-  return c.json({ shops: rows });
+      from shops s where s.active`;
+
+  const near = [];
+  let unplaceable = 0;
+  for (const s of rows) {
+    const mi = milesBetween(here, { lat: s.lat, lon: s.lon });
+    if (mi == null) {
+      /* No coordinates: it may still be the shop they are looking for if the
+         ZIP matches exactly, but it is never claimed to be a distance away. */
+      if (s.zip === zip) near.push({ ...s, miles: null });
+      else unplaceable++;
+      continue;
+    }
+    if (mi <= radius) near.push({ ...s, miles: Math.round(mi * 10) / 10 });
+  }
+  near.sort((a, b) => (a.miles ?? 1e9) - (b.miles ?? 1e9) || a.name.localeCompare(b.name));
+
+  /* Shops this phone follows that fall OUTSIDE the radius, with their true
+     distance from the ZIP just searched.
+     
+     The app has to keep a followed shop reachable — losing sight of one reads
+     as a lost follow — but it has no geography of its own to measure with, and
+     giving it any would be how invented distances crept back in. So the answer
+     comes from here, in the same request, under its own key: a separate list
+     the app can show under a separate heading, never counted as nearby. */
+  const device = await deviceFrom(c);
+  let followedOutside = [];
+  if (device) {
+    const inList = new Set(near.map((s) => s.id));
+    const followed = await sql`
+      select ${shopShape}, s.lat, s.lon,
+             coalesce((select array_agg(a.aisle order by a.position, a.aisle)
+                         from shop_aisles a where a.shop_id = s.id), '{}') as aisles,
+             (select count(*) from follows f2 where f2.shop_id = s.id) as followers
+        from follows f join shops s on s.id = f.shop_id
+       where f.device_id = ${device.id} and s.active`;
+    followedOutside = followed
+      .filter((s) => !inList.has(s.id))
+      .map((s) => ({ ...s, miles: (() => {
+        const mi = milesBetween(here, { lat: s.lat, lon: s.lon });
+        return mi == null ? null : Math.round(mi * 10) / 10;
+      })() }))
+      .sort((a, b) => (a.miles ?? 1e9) - (b.miles ?? 1e9));
+  }
+
+  return c.json({ shops: near, zip, radius,
+                  followed_outside: followedOutside,
+                  /* Said plainly so the app can explain an empty list rather
+                     than implying there are no shops anywhere. */
+                  unplaceable });
 });
 
 app.get("/v1/shops/:slug", async (c) => {
@@ -802,9 +868,15 @@ app.post("/v1/admin/shops", async (c) => {
     return fail(c, 409, "that shop is already on the app");
   }
 
+  /* Place it on the map at creation, from its own ZIP's centroid. Without
+     this a shop has no coordinates, and anything that tries to measure a
+     distance to it has to either invent one or admit it cannot — the first of
+     which is what went wrong. */
+  const at = zipPoint(b.zip);
   const fields = {
     name: b.name, address: b.address, town: b.town, zip: b.zip,
     hours: b.hours ?? null, daily_cap: b.daily_cap, min_age: b.min_age ?? null,
+    lat: at?.lat ?? null, lon: at?.lon ?? null,
   };
 
   if (existing) {
@@ -889,6 +961,32 @@ app.post("/v1/admin/invites", async (c) => {
       : "mail is not sending — pass them this link yourself",
   }, 201);
 });
+
+/* Place any shop that has no coordinates yet.
+ *
+ * Shops created before distance existed carry no lat/lon, and a shop without
+ * them can only be found by an exact ZIP match — it is never offered to a
+ * search by distance. Doing it here means an existing pilot shop starts
+ * working the moment this deploys, with nothing to run by hand. Cheap, and a
+ * no-op on every boot after the first. */
+async function placeUnplacedShops() {
+  try {
+    const rows = await sql`select id, zip from shops where lat is null`;
+    let placed = 0;
+    for (const r of rows) {
+      const at = zipPoint(r.zip);
+      if (!at) continue;
+      await sql`update shops set lat = ${at.lat}, lon = ${at.lon} where id = ${r.id}`;
+      placed++;
+    }
+    if (placed) console.log(`[geo] placed ${placed} shop(s) from their ZIP`);
+  } catch (e) {
+    /* Never block startup on this: the app works without it, shops just stay
+       findable by exact ZIP only. */
+    console.error("[geo] could not place shops:", e.message);
+  }
+}
+placeUnplacedShops();
 
 const port = Number(process.env.PORT || 8787);
 serve({ fetch: app.fetch, port }, () =>
