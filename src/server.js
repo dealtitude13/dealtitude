@@ -14,7 +14,7 @@ import { sendSignInLink, sendInviteLink, mailConfigured } from "./mail.js";
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-14e";
+const BUILD = "2026-10-14f";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -789,12 +789,39 @@ app.post("/v1/admin/reset", async (c) => {
 app.post("/v1/admin/shops", async (c) => {
   guard(c);
   const b = parse(ShopIn, await c.req.json());
+
+  /* A shop taken off the app keeps its row, so it keeps its name — and the
+     name is derived from the shop's own name, so re-adding that shop failed
+     with "already exists" and nothing in the app could bring it back. The
+     only cure was a database. Standing in a shop you took down by mistake,
+     "add it again" plainly means "put it back", so that is what this does. */
+  const [existing] = await sql`
+    select id, active from shops where slug = ${b.slug}`;
+
+  if (existing?.active) {
+    return fail(c, 409, "that shop is already on the app");
+  }
+
+  const fields = {
+    name: b.name, address: b.address, town: b.town, zip: b.zip,
+    hours: b.hours ?? null, daily_cap: b.daily_cap, min_age: b.min_age ?? null,
+  };
+
+  if (existing) {
+    /* Back on, with whatever details were just typed in — they are fresher
+       than the ones it went down with. Its posts and followers were never
+       deleted, so they come back with it. */
+    const [shop] = await sql`
+      update shops set ${sql({ ...fields, active: true })}
+       where id = ${existing.id} returning *`;
+    await sql`delete from shop_aisles where shop_id = ${shop.id}`;
+    await sql`insert into shop_aisles ${sql(
+      b.aisles.map((aisle, position) => ({ shop_id: shop.id, aisle, position })))}`;
+    return c.json({ shop, restored: true }, 200);
+  }
+
   const [shop] = await sql`
-    insert into shops ${sql({
-      slug: b.slug, name: b.name, address: b.address, town: b.town,
-      zip: b.zip, hours: b.hours ?? null, daily_cap: b.daily_cap,
-      min_age: b.min_age ?? null })}
-    returning *`;
+    insert into shops ${sql({ slug: b.slug, ...fields })} returning *`;
   await sql`insert into shop_aisles ${sql(
     b.aisles.map((aisle, position) => ({ shop_id: shop.id, aisle, position })))}`;
   return c.json({ shop }, 201);
