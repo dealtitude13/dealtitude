@@ -15,7 +15,7 @@ import { sendSignInLink, sendInviteLink, mailConfigured } from "./mail.js";
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-15c";
+const BUILD = "2026-10-15d";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -117,6 +117,8 @@ app.get("/v1/health", async (c) => {
     /* Two builds, because "is my change live?" was the hardest question to
        answer all week. BUILD is written by hand and matches the app's stamp;
        commit is whatever the host happened to deploy. */
+    /* "did my migration run" answered without a shell. */
+    schema: schemaState,
     build: BUILD,
     commit: process.env.RENDER_GIT_COMMIT?.slice(0, 7) || null,
   }, db ? 200 : 503);
@@ -521,6 +523,116 @@ app.delete("/v1/shops/:slug/follow", async (c) => {
   return c.json({ following: false });
 });
 
+/* ------------------------------------------------------------------ wants ---
+ * An item a shopper is hoping to see, in their own words. Three things make
+ * this different from picking an aisle, and all three are why it replaced a
+ * second copy of the aisle list:
+ *
+ *   it is an ITEM, so the owner learns something he does not already know;
+ *   it is counted across shoppers, so "6 waiting on Kaju Katli" is a fact;
+ *   it earns a standing alert for that item, which outranks the aisle filter.
+ *
+ * Asking implies following — you cannot be told about the thing you asked for
+ * otherwise — so the POST creates the follow if it isn't there. It never
+ * touches the aisles of a follow that already exists: a want is an addition to
+ * what someone chose, never a quiet edit of it. */
+
+const WantIn = z.object({
+  label: z.string().min(2).max(80),
+  aisle: z.string().max(40).optional(),
+  alert: z.boolean().optional(),
+});
+
+/** The list, plus what this device asked for, plus something to autocomplete
+    against. Device auth is optional — a browsing shopper still sees the
+    counts, which is most of the reason to leave an ask at all. */
+app.get("/v1/shops/:slug/wants", async (c) => {
+  const [shop] = await sql`
+    select id from shops where slug = ${c.req.param("slug")} and active`;
+  if (!shop) return fail(c, 404, "no such shop");
+
+  const wants = await sql`select * from wants_for(${shop.id})`;
+
+  /* Autocomplete source: what this shop has actually posted before. Offering
+     the shop's own catalogue is what keeps forty spellings of one item from
+     becoming forty separate asks nobody can count. */
+  const suggest = await sql`
+    select distinct on (norm_item(name)) name as label, aisle
+      from catalog where shop_id = ${shop.id}
+     order by norm_item(name), updated_at desc limit 60`;
+
+  const device = await deviceFrom(c);
+  const mine = device
+    ? await sql`select norm, label, aisle, alert from wants
+                 where shop_id = ${shop.id} and device_id = ${device.id}
+                   and filled_at is null`
+    : [];
+  return c.json({ wants, suggest, mine });
+});
+
+app.post("/v1/shops/:slug/wants", async (c) => {
+  const device = await need(c);
+  const b = parse(WantIn, await c.req.json());
+  const [shop] = await sql`
+    select id, min_age from shops where slug = ${c.req.param("slug")} and active`;
+  if (!shop) return fail(c, 404, "no such shop");
+  /* Same gate as following, for the same reason: an ask that turns into an
+     alert is a subscription, and the age bar is on the subscription. */
+  if (!oldEnough(device, shop))
+    return fail(c, 403, "confirm your age before asking this shop for something");
+
+  const [{ norm }] = await sql`select norm_item(${b.label}) as norm`;
+  if (!norm) return fail(c, 400, "say what you're hoping to see");
+
+  /* Only an aisle this shop has; otherwise leave it null and let the owner
+     file it when he posts. A wrong aisle on a want would route the eventual
+     alert at the wrong people. */
+  let aisle = null;
+  if (b.aisle) {
+    const [has] = await sql`
+      select 1 from shop_aisles where shop_id = ${shop.id} and aisle = ${b.aisle}`;
+    if (has) aisle = b.aisle;
+  }
+  /* Nothing chosen: infer it from the shop's own catalogue, which is where the
+     suggestion most likely came from. */
+  if (!aisle) {
+    const [guess] = await sql`
+      select aisle from catalog
+       where shop_id = ${shop.id} and norm_item(name) = ${norm} and aisle is not null
+       limit 1`;
+    if (guess) aisle = guess.aisle;
+  }
+
+  await sql`
+    insert into follows (device_id, shop_id, aisles)
+    values (${device.id}, ${shop.id}, '{}')
+    on conflict (device_id, shop_id) do nothing`;
+
+  await sql`
+    insert into wants (shop_id, device_id, label, norm, aisle, alert)
+    values (${shop.id}, ${device.id}, ${b.label.trim()}, ${norm}, ${aisle},
+            ${b.alert ?? true})
+    on conflict (shop_id, device_id, norm) do update
+      set label = excluded.label, aisle = coalesce(excluded.aisle, wants.aisle),
+          alert = excluded.alert, filled_at = null`;
+
+  const [row] = await sql`
+    select norm, label, shoppers, aisle from wants_for(${shop.id}) where norm = ${norm}`;
+  return c.json({ asked: true, want: row }, 201);
+});
+
+app.delete("/v1/shops/:slug/wants/:norm", async (c) => {
+  const device = await need(c);
+  const [shop] = await sql`select id from shops where slug = ${c.req.param("slug")}`;
+  if (!shop) return fail(c, 404, "no such shop");
+  const [{ norm }] = await sql`select norm_item(${c.req.param("norm")}) as norm`;
+  await sql`delete from wants
+             where shop_id = ${shop.id} and device_id = ${device.id} and norm = ${norm}`;
+  const [row] = await sql`
+    select norm, label, shoppers from wants_for(${shop.id}) where norm = ${norm}`;
+  return c.json({ asked: false, want: row || null });
+});
+
 app.get("/v1/me/follows", async (c) => {
   const device = await need(c);
   const rows = await sql`
@@ -814,6 +926,18 @@ app.get("/v1/owner/shops/:slug/reach", async (c) => {
   return c.json({ ...reach, ...week, aisles });
 });
 
+/* Real demand, most-wanted first. The panel this feeds used to read the
+   shopper app's own local state, so an owner was shown his own taps. */
+app.get("/v1/owner/shops/:slug/wants", async (c) => {
+  const owner = await needOwner(c);
+  const shop = await needShop(c, owner);
+  const wants = await sql`select * from wants_for(${shop.id})`;
+  const [filled] = await sql`
+    select count(*) as filled from wants
+     where shop_id = ${shop.id} and filled_at > now() - interval '30 days'`;
+  return c.json({ wants, ...filled });
+});
+
 app.get("/v1/owner/shops/:slug/catalog/:gtin", async (c) => {
   const owner = await needOwner(c);
   const shop = await needShop(c, owner);
@@ -1000,6 +1124,43 @@ async function placeUnplacedShops() {
     console.error("[geo] could not place shops:", e.message);
   }
 }
+/* Apply the schema on boot.
+ *
+ * schema.sql is idempotent all the way through — create-if-not-exists,
+ * create-or-replace, and one authoritative list for each constraint — so
+ * running it every boot is a no-op after the first and costs a few hundred
+ * milliseconds.
+ *
+ * It is here rather than left to `npm run migrate` because the alternative is
+ * a deploy where the code is new and the database is not: the `wants` table
+ * would be missing, every shop page would 500 on its "hoping for something
+ * else" list, and the only clue would be a stack trace in a log nobody is
+ * watching. Whoever deploys this should not have to know which release needed
+ * a migration.
+ *
+ * A failure must be loud but must not stop the server: an owner locked out of
+ * a working app is worse than one running on yesterday's schema. /v1/health
+ * reports it either way, which is the one place to look. */
+let schemaState = "pending";
+async function applySchema() {
+  try {
+    const { readFileSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const { dirname, join } = await import("node:path");
+    const here = dirname(fileURLToPath(import.meta.url));
+    await sql.unsafe(readFileSync(join(here, "../db/schema.sql"), "utf8"));
+    schemaState = "ok";
+    console.log("[schema] applied");
+  } catch (e) {
+    schemaState = `failed: ${e.message}`;
+    console.error("[schema] COULD NOT APPLY —", e.message);
+    console.error("[schema] the server is still serving, on whatever schema "
+                + "the database already had. /v1/health says so.");
+  }
+}
+export const schemaStatus = () => schemaState;
+
+await applySchema();
 placeUnplacedShops();
 
 const port = Number(process.env.PORT || 8787);

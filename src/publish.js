@@ -87,9 +87,26 @@ export async function publish(shopId, input, postedBy = null) {
             updated_at = now()`;
   }
 
+  /* Who asked for this exact item. recipients_for() has already used these to
+     override the aisle filter; they are fetched again here so the owner can be
+     told how much of the reach was people waiting for it, which is the whole
+     argument for the feature. */
+  const askers = wide ? [] : await sql`
+    select device_id from wants
+     where shop_id = ${shopId} and alert and norm = norm_item(${input.name})`;
+  const askedBy = new Set(askers.map((r) => r.device_id));
+
   const rows = await sql`select * from recipients_for(${post.id})`;
   const toSend = rows.filter((r) => r.withheld === null);
   const held   = rows.filter((r) => r.withheld !== null);
+
+  /* Every follower ends up in exactly one of these. Counting them here rather
+     than letting the caller infer from an empty `withheld` is the whole fix:
+     the app used to read "nothing withheld, nothing sent" as "no followers",
+     and said so to a shop that had one. */
+  const withheld = {};
+  const note = (reason) => { withheld[reason] = (withheld[reason] || 0) + 1; };
+  for (const r of held) note(r.withheld);
 
   /* Record the held ones first. If sending falls over halfway, the ledger
      still reflects the decisions that were made. */
@@ -102,25 +119,58 @@ export async function publish(shopId, input, postedBy = null) {
   const payload = { ...compose(shop, post), postId: post.id, shop: shop.slug,
                     kind: post.kind };
 
-  let sent = 0;
+  /* Why the send failed decides who can do something about it, so each reason
+     keeps its own name all the way to the owner's screen. Flattening them all
+     to 'no_device' told a shopkeeper their follower's phone was broken when
+     the truth was that this server had no VAPID keys. */
+  const SEND_FAIL = {
+    no_subscription:     "no_device",          // they never switched alerts on
+    push_not_configured: "push_unconfigured",  // ours, not theirs
+    unsupported_kind:    "send_failed",
+    push_404:            "gone",
+    push_410:            "gone",
+  };
+  const failReason = (reason) =>
+    SEND_FAIL[reason] || (/^push_4\d\d$/.test(reason || "") ? "gone" : "send_failed");
+
+  let sent = 0, reachedAskers = 0;
   for (const r of toSend) {
     const [device] = await sql`select * from devices where id = ${r.device_id}`;
-    if (!device) continue;
+    /* A follow whose device vanished between the query and here. Rare, but it
+       used to `continue` and so went into neither total. */
+    if (!device) { note("no_device"); continue; }
     const res = await send(device, payload);
     if (res.ok) {
       sent++;
+      if (askedBy.has(r.device_id)) reachedAskers++;
       await sql`insert into deliveries (post_id, device_id, shop_id)
                 values (${post.id}, ${r.device_id}, ${shopId})
                 on conflict do nothing`;
     } else {
       if (res.retire) await retireDevice(r.device_id, res.reason);
+      const reason = failReason(res.reason);
+      note(reason);
       await sql`insert into deliveries (post_id, device_id, shop_id, withheld)
-                values (${post.id}, ${r.device_id}, ${shopId}, 'no_device')
+                values (${post.id}, ${r.device_id}, ${shopId}, ${reason})
                 on conflict do nothing`;
     }
   }
 
-  const withheld = {};
-  for (const r of held) withheld[r.withheld] = (withheld[r.withheld] || 0) + 1;
-  return { post, sent, withheld };
+  /* The ask is answered, so it leaves the shop's unmet-demand list. The row
+     itself stays, and stays alerting: someone who wants Kaju Katli wants to
+     know the next time it is on sale too. wants_for() filters on filled_at,
+     recipients_for() deliberately does not. */
+  if (askedBy.size) {
+    await sql`update wants set filled_at = now()
+               where shop_id = ${shopId} and norm = norm_item(${input.name})
+                 and filled_at is null`;
+  }
+
+  /* followers is the real denominator — the only thing that can honestly
+     answer "does anyone follow this shop?". eligible is how many got past
+     every rule and were actually attempted. asked_for is how many of the
+     people reached had specifically asked for this item. */
+  return { post, sent, withheld,
+           followers: rows.length, eligible: toSend.length,
+           asked_for: askedBy.size, asked_reached: reachedAskers };
 }
