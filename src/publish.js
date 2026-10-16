@@ -122,18 +122,38 @@ export async function publish(shopId, input, postedBy = null) {
   /* Why the send failed decides who can do something about it, so each reason
      keeps its own name all the way to the owner's screen. Flattening them all
      to 'no_device' told a shopkeeper their follower's phone was broken when
-     the truth was that this server had no VAPID keys. */
-  const SEND_FAIL = {
-    no_subscription:     "no_device",          // they never switched alerts on
-    push_not_configured: "push_unconfigured",  // ours, not theirs
-    unsupported_kind:    "send_failed",
-    push_404:            "gone",
-    push_410:            "gone",
-  };
-  const failReason = (reason) =>
-    SEND_FAIL[reason] || (/^push_4\d\d$/.test(reason || "") ? "gone" : "send_failed");
+     the truth was that this server had no VAPID keys.
+     The first version of this map only knew the web sender's spellings
+     (push_404, push_not_configured). Apple's and Google's reasons come back
+     prefixed apns_ / fcm_ — apns_BadDeviceToken_both, apns_InvalidProviderToken,
+     fcm_404 — so every one of them fell through to 'send_failed' and was
+     reported as a momentary refusal worth retrying. Two of those are
+     permanent and one is a misconfiguration on this server. */
+
+  /* Said by the provider when THIS SERVER is set up wrong: the signing key,
+     the team or key id, the bundle id. Nothing the shop or the shopper can do,
+     and retrying forever will not fix it. */
+  const OURS = /not_configured|InvalidProviderToken|ExpiredProviderToken|MissingProviderToken|TopicDisallowed|MissingTopic|BadCertificate|Forbidden|^(apns|fcm|push)_40[13]$/i;
+
+  /* Said when the phone is genuinely unreachable for good. */
+  const DEAD = /Unregistered|DeviceTokenNotForTopic|BadDeviceToken_both|NotRegistered|InvalidRegistration|^(apns|fcm|push)_(404|410)$/i;
+
+  function failReason(reason, retire) {
+    const r = String(reason || "");
+    /* The sender already decided this phone is finished — it is about to be
+       retired, so the owner should be told it is gone, not that Apple had a
+       bad moment. */
+    if (retire || DEAD.test(r)) return "gone";
+    if (/no_subscription/.test(r)) return "no_device";
+    if (OURS.test(r)) return "push_unconfigured";
+    if (/unsupported_kind/.test(r)) return "send_failed";
+    return "send_failed";
+  }
 
   let sent = 0, reachedAskers = 0;
+  /* reason bucket -> the provider's last raw word for it, so the screen can
+     show the real cause under the plain-English line. */
+  const detail = {};
   for (const r of toSend) {
     const [device] = await sql`select * from devices where id = ${r.device_id}`;
     /* A follow whose device vanished between the query and here. Rare, but it
@@ -148,10 +168,19 @@ export async function publish(shopId, input, postedBy = null) {
                 on conflict do nothing`;
     } else {
       if (res.retire) await retireDevice(r.device_id, res.reason);
-      const reason = failReason(res.reason);
+      const reason = failReason(res.reason, res.retire);
       note(reason);
-      await sql`insert into deliveries (post_id, device_id, shop_id, withheld)
-                values (${post.id}, ${r.device_id}, ${shopId}, ${reason})
+      /* Keep the provider's own words. Without this the only record of WHY is
+         a line in the service log, which rules out everyone who is not holding
+         a terminal — including the person whose shop it is. The device token
+         is deliberately not recorded here; the reason alone is what diagnoses
+         it, and `device_id` already says which follower. */
+      detail[reason] = res.reason || "unknown";
+      console.warn(`[publish] ${shop.slug}: send failed for device `
+                 + `${r.device_id} (${device.kind}) — ${res.reason} -> ${reason}`);
+      await sql`insert into deliveries (post_id, device_id, shop_id, withheld, detail)
+                values (${post.id}, ${r.device_id}, ${shopId}, ${reason},
+                        ${res.reason || null})
                 on conflict do nothing`;
     }
   }
@@ -170,7 +199,7 @@ export async function publish(shopId, input, postedBy = null) {
      answer "does anyone follow this shop?". eligible is how many got past
      every rule and were actually attempted. asked_for is how many of the
      people reached had specifically asked for this item. */
-  return { post, sent, withheld,
+  return { post, sent, withheld, detail,
            followers: rows.length, eligible: toSend.length,
            asked_for: askedBy.size, asked_reached: reachedAskers };
 }

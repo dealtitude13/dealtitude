@@ -518,3 +518,13 @@ language sql stable as $$
     join follows f on f.shop_id = p.shop_id
     left join devices d on d.id = f.device_id and d.retired_at is null
 $$;
+
+-- The provider's own words, kept next to the decision.
+--
+-- Every APNs and FCM failure reason was being flattened into one bucket before
+-- it reached anybody: a wrong signing key, a token Apple has never heard of,
+-- and a momentary HTTP/2 reset all arrived on the owner's screen as "the alert
+-- service refused it — try again shortly". The first two are not transient and
+-- retrying is the wrong advice. Diagnosing it meant reading the service log,
+-- which the person running a shop cannot do.
+alter table deliveries add column if not exists detail text;
