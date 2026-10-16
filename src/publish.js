@@ -133,10 +133,12 @@ export async function publish(shopId, input, postedBy = null) {
   /* Said by the provider when THIS SERVER is set up wrong: the signing key,
      the team or key id, the bundle id. Nothing the shop or the shopper can do,
      and retrying forever will not fix it. */
-  const OURS = /not_configured|InvalidProviderToken|ExpiredProviderToken|MissingProviderToken|TopicDisallowed|MissingTopic|BadCertificate|Forbidden|^(apns|fcm|push)_40[13]$/i;
+  const OURS = /not_configured|auth_failed|InvalidProviderToken|ExpiredProviderToken|MissingProviderToken|TopicDisallowed|MissingTopic|BadCertificate|Forbidden|SenderIdMismatch|^(apns|fcm|push)_40[13]$/i;
 
-  /* Said when the phone is genuinely unreachable for good. */
-  const DEAD = /Unregistered|DeviceTokenNotForTopic|BadDeviceToken_both|NotRegistered|InvalidRegistration|^(apns|fcm|push)_(404|410)$/i;
+  /* Said when the phone is genuinely unreachable for good. Both senders also
+     set `retire` for these, and that is what decides below — this pattern is
+     the belt to that braces, for a reason string that arrives without it. */
+  const DEAD = /UNREGISTERED|Unregistered|DeviceTokenNotForTopic|BadDeviceToken_both|NotRegistered|InvalidRegistration|INVALID_ARGUMENT|^(apns|fcm|push)_(404|410)$/i;
 
   function failReason(reason, retire) {
     const r = String(reason || "");
