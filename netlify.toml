@@ -1,0 +1,18 @@
+# Dealtitude — where the website actually is.
+#
+# The site's files are in www/, not at the top of this repo: src/ is the source
+# the bundle is built FROM, and www/ is the built site. Without this file
+# Netlify looks for a home page at the repo root, finds none, and serves its
+# own "Page not found" for every address including the front page — which is
+# indistinguishable, from the outside, from the domain not being set up.
+#
+# www/_redirects lives inside the published folder and is only read from there,
+# so this setting is also what makes a printed shop card like
+# dealtitude.com/wine-locker serve the app instead of a 404.
+[build]
+  publish = "www"
+  # Nothing to build here. The bundle in www/app.js is committed already, so
+  # Netlify must not try to run its own build — an npm build on the host needs
+  # devDependencies it has no reason to install, and a failed build takes the
+  # whole site down rather than leaving the last good one up.
+  command = ""
