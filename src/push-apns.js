@@ -117,6 +117,14 @@ export function close() {
  * phone belongs to — the caller stores that so the next send goes straight
  * there.
  */
+/* Apple has more than one way of saying "that token is not for this service".
+   All of them mean: try the other one before writing the phone off. */
+const ENV_MISMATCH = new Set([
+  "apns_BadDeviceToken",
+  "apns_BadEnvironmentKeyInToken",
+  "apns_BadCertificateEnvironment",
+]);
+
 export async function send(device, payload) {
   if (!configured) return { ok: false, retire: false, reason: "apns_not_configured" };
 
@@ -126,9 +134,15 @@ export async function send(device, payload) {
   const second = first === "production" ? "sandbox" : "production";
 
   const a = await attempt(device, payload, first);
-  /* Only ONE answer means "right token, wrong service", and it is the one that
-     otherwise gets a real follower deleted. Everything else is final. */
-  if (a.ok || a.reason !== "apns_BadDeviceToken") {
+  /* These answers mean "right token, wrong one of Apple's two services", and
+     they are the ones that otherwise get a real follower deleted. Everything
+     else is final.
+     This was a single string — BadDeviceToken — and a phone built from Xcode
+     is issued a DEVELOPMENT token, which production APNs refuses with
+     BadEnvironmentKeyInToken instead. Different word, same meaning, and it
+     skipped the retry entirely: the shop was told "the alert service refused
+     it, try again shortly" forever, for a follower who was one hop away. */
+  if (a.ok || !ENV_MISMATCH.has(a.reason)) {
     return device.push_env ? a : { ...a, env: a.ok ? first : undefined };
   }
 
@@ -137,8 +151,13 @@ export async function send(device, payload) {
     console.warn(`[apns] device belongs to ${second}, not ${first} — remembered`);
     return { ok: true, env: second };
   }
-  /* Rejected by both services: now it genuinely is not a phone we can reach. */
-  return { ok: false, retire: true, reason: `apns_BadDeviceToken_both` };
+  /* Refused by both. Carry APNS's OWN second answer rather than a synthesised
+     one: if both services say the token is bad the phone is genuinely gone,
+     but if the second attempt failed for some other reason — a bad signing
+     key, say — that is ours to fix and must not be reported as a follower who
+     uninstalled the app. */
+  const bothSayBadToken = ENV_MISMATCH.has(b.reason);
+  return { ok: false, retire: bothSayBadToken, reason: `${b.reason}_both` };
 }
 
 function attempt(device, payload, env) {
