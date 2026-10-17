@@ -528,3 +528,66 @@ $$;
 -- retrying is the wrong advice. Diagnosing it meant reading the service log,
 -- which the person running a shop cannot do.
 alter table deliveries add column if not exists detail text;
+
+-- ------------------------------------------------- posts that end by themselves
+--
+-- `ends` was only ever text — "Today, 9:00 PM", or whatever a browser's
+-- datetime field produced. Readable, and impossible to compare against the
+-- clock, so a sale stayed "on" until somebody pressed a button. A shelf that
+-- says one thing while the app says another is the fastest way to lose a
+-- shop's trust, and it was happening by default.
+--
+-- ends_at is an INSTANT. The phone converts the shopkeeper's local
+-- "9:00 PM today" to one, so a shop in Monroe and a shop three time zones
+-- away both expire when their own evening ends rather than when UTC says so.
+-- `ends` stays for display: it is what the owner typed, in their words.
+alter table posts add column if not exists ends_at timestamptz;
+create index if not exists posts_expiring_idx on posts (ends_at)
+  where status = 'active' and ends_at is not null;
+
+-- 'expired' is a third state, distinct from 'ended'. Ended is a decision
+-- somebody made; expired is the clock arriving. The owner is owed the
+-- difference when looking back at what they posted.
+alter table posts drop constraint if exists posts_status_check;
+alter table posts add constraint posts_status_check
+  check (status in ('active','ended','expired'));
+
+-- One rule for "has this run out", used by the sweep and by every read.
+create or replace function expire_due_posts() returns integer
+language sql as $$
+  with done as (
+    update posts set status = 'expired'
+     where status = 'active' and ends_at is not null and ends_at <= now()
+     returning 1
+  ) select count(*)::int from done
+$$;
+
+-- --------------------------------------------------- shops: the editable bits
+alter table shops add column if not exists phone text;
+alter table shops add column if not exists note text;      -- a line about the shop
+alter table shops add column if not exists updated_at timestamptz;
+
+-- --------------------------------------------------- moderating the ask list
+-- An owner can take an item off their own demand list. It is removed for THAT
+-- shop only: wants are rows per (shop, device), so nothing here can reach
+-- another shop's list, and a shopper who asked the same thing of a different
+-- shop still has it. Hidden rather than deleted, so the same text cannot be
+-- re-posted into the list five seconds later by the same device.
+alter table wants add column if not exists hidden_at timestamptz;
+
+create or replace function wants_for(p_shop_id uuid)
+returns table (norm text, label text, shoppers bigint, aisle text,
+               alerting bigint, last_at timestamptz)
+language sql stable as $$
+  select w.norm,
+         (array_agg(w.label order by w.created_at desc))[1]                  as label,
+         count(*)                                                           as shoppers,
+         (array_agg(w.aisle order by w.created_at desc)
+            filter (where w.aisle is not null))[1]                          as aisle,
+         count(*) filter (where w.alert)                                     as alerting,
+         max(w.created_at)                                                   as last_at
+    from wants w
+   where w.shop_id = p_shop_id and w.filled_at is null and w.hidden_at is null
+   group by w.norm
+   order by count(*) desc, max(w.created_at) desc
+$$;

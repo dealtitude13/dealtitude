@@ -15,7 +15,7 @@ import { sendSignInLink, sendInviteLink, mailConfigured } from "./mail.js";
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-16b";
+const BUILD = "2026-10-17a";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -440,6 +440,9 @@ app.get("/v1/shops/:slug", async (c) => {
   const posts = await sql`
     select id, kind, aisle, name, note, was_cents, now_cents, ends, created_at
       from posts where shop_id = ${s.id} and status = 'active'
+         /* Also checked here, not only by the sweep: a shopper must never be
+            shown a sale that has already run out, however recently it did. */
+         and (ends_at is null or ends_at > now())
      order by created_at desc limit 30`;
   return c.json({ shop: s, posts });
 });
@@ -656,6 +659,7 @@ app.get("/v1/me/feed", async (c) => {
          sits inside a template literal, where one would end the query. */
       join shops s on s.id = p.shop_id and s.active
      where p.status = 'active'
+       and (p.ends_at is null or p.ends_at > now())
        and (p.kind in ('hours','notice') or p.aisle = any (f.aisles))
        /* An age-restricted shop's posts only appear once this device has
           cleared that shop's bar. A follow made before the gate existed, or a
@@ -874,7 +878,12 @@ const PostIn = z.object({
   gtin: z.string().regex(/^\d{8,14}$/).optional(),
   was_cents: z.number().int().min(0).max(10_000_00).optional(),
   now_cents: z.number().int().min(0).max(10_000_00).optional(),
+  /* What the owner typed, for reading. */
   ends: z.string().max(60).optional(),
+  /* The same moment as an instant, for the clock. The phone converts the
+     shopkeeper's local "9pm today" before sending, so a shop expires at its
+     own closing time rather than at UTC's. */
+  ends_at: z.string().datetime({ offset: true }).optional(),
 });
 
 app.post("/v1/owner/shops/:slug/posts", async (c) => {
@@ -883,6 +892,10 @@ app.post("/v1/owner/shops/:slug/posts", async (c) => {
   const body = parse(PostIn, await c.req.json());
   if (body.kind === "sale" && body.now_cents == null)
     return fail(c, 400, "a sale needs a price");
+  /* Publishing something already over would alert every follower about a sale
+     they cannot use, and the sweep would mark it expired moments later. */
+  if (body.ends_at && new Date(body.ends_at) <= new Date())
+    return fail(c, 400, "that end time has already passed");
   const out = await publish(shop.id, body, owner.email);
   return c.json(out, 201);
 });
@@ -890,6 +903,11 @@ app.post("/v1/owner/shops/:slug/posts", async (c) => {
 app.get("/v1/owner/shops/:slug/posts", async (c) => {
   const owner = await needOwner(c);
   const shop = await needShop(c, owner);
+  /* Expire before reading. The sweep below runs on a timer, but a read must
+     never be able to show a sale as live when its own end time has passed —
+     the timer being a minute behind is not a reason to tell a shopkeeper
+     something untrue about their own shelf. */
+  await sql`select expire_due_posts()`;
   const rows = await sql`
     select p.*,
            (select count(*) from deliveries d
@@ -901,14 +919,63 @@ app.get("/v1/owner/shops/:slug/posts", async (c) => {
   return c.json({ posts: rows });
 });
 
+/* Editing a post, or taking it down, through one route.
+ *
+ * A mistyped price used to mean deleting the post and writing it again, which
+ * alerts every follower a second time for the same item. Correcting it must
+ * not cost the shop its goodwill — so an edit NEVER re-sends. The alert went
+ * when it went; this changes what the app shows from here on.
+ *
+ * The kind and the aisle are deliberately NOT editable: they decided who was
+ * told. Changing them after the fact would leave a post in front of people it
+ * was never sent to, and absent from the ones it was. A different audience is
+ * a different post. */
+const PostEdit = z.object({
+  status:    z.enum(["active", "ended"]).optional(),
+  name:      z.string().min(2).max(80).optional(),
+  note:      z.string().max(300).nullable().optional(),
+  was_cents: z.number().int().min(0).nullable().optional(),
+  now_cents: z.number().int().min(0).nullable().optional(),
+  ends:      z.string().max(60).nullable().optional(),
+  ends_at:   z.string().datetime({ offset: true }).nullable().optional(),
+});
+
 app.patch("/v1/owner/shops/:slug/posts/:id", async (c) => {
   const owner = await needOwner(c);
   const shop = await needShop(c, owner);
-  const { status } = parse(z.object({ status: z.enum(["active", "ended"]) }),
-                           await c.req.json());
-  const [p] = await sql`update posts set status = ${status}
-     where id = ${c.req.param("id")} and shop_id = ${shop.id} returning id, status`;
-  if (!p) return fail(c, 404, "no such post");
+  const b = parse(PostEdit, await c.req.json());
+
+  const [before] = await sql`
+    select * from posts where id = ${c.req.param("id")} and shop_id = ${shop.id}`;
+  if (!before) return fail(c, 404, "no such post");
+
+  const patch = {};
+  for (const k of ["name", "note", "was_cents", "now_cents", "ends"]) {
+    if (b[k] !== undefined) patch[k] = b[k];
+  }
+  if (b.ends_at !== undefined) patch.ends_at = b.ends_at ? new Date(b.ends_at) : null;
+
+  /* A sale without a price is not a sale. */
+  const nowCents = patch.now_cents !== undefined ? patch.now_cents : before.now_cents;
+  if (before.kind === "sale" && nowCents == null)
+    return fail(c, 400, "a sale needs a price");
+
+  if (b.status !== undefined) {
+    /* Putting an expired post back on the shelf needs a future end time, or it
+       expires again on the next sweep and the owner is left pressing a button
+       that appears to do nothing. */
+    if (b.status === "active") {
+      const endsAt = patch.ends_at !== undefined ? patch.ends_at : before.ends_at;
+      if (endsAt && new Date(endsAt) <= new Date())
+        return fail(c, 400, "give it a new end time before putting it back on");
+    }
+    patch.status = b.status;
+  }
+
+  if (!Object.keys(patch).length) return c.json(before);
+
+  const [p] = await sql`
+    update posts set ${sql(patch)} where id = ${before.id} returning *`;
   return c.json(p);
 });
 
@@ -936,6 +1003,127 @@ app.get("/v1/owner/shops/:slug/wants", async (c) => {
     select count(*) as filled from wants
      where shop_id = ${shop.id} and filled_at > now() - interval '30 days'`;
   return c.json({ wants, ...filled });
+});
+
+/* ------------------------------------------- the shop's own details --------
+ * There was no way to change a shop after it was created. A mistyped address
+ * or a change of hours meant removing the shop and adding it again, which is
+ * drastic for a typo and takes the shop off the app in between.
+ *
+ * The slug is NOT editable: it is the address on a printed counter card, and
+ * changing it would turn every card already in a customer's pocket into a dead
+ * link. The ZIP moves the shop on the map, so it is re-placed when it changes. */
+const ShopEdit = z.object({
+  name:      z.string().min(2).max(80).optional(),
+  address:   z.string().min(2).max(120).optional(),
+  town:      z.string().min(2).max(60).optional(),
+  zip:       z.string().regex(/^\d{5}$/).optional(),
+  hours:     z.string().max(80).nullable().optional(),
+  phone:     z.string().max(32).nullable().optional(),
+  note:      z.string().max(280).nullable().optional(),
+  daily_cap: z.number().int().min(1).max(10).optional(),
+  aisles:    z.array(z.string().min(1).max(40)).max(24).optional(),
+});
+
+app.patch("/v1/owner/shops/:slug", async (c) => {
+  const owner = await needOwner(c);
+  const shop = await needShop(c, owner);          // membership is checked here
+  const b = parse(ShopEdit, await c.req.json());
+
+  const patch = {};
+  for (const k of ["name", "address", "town", "zip", "hours", "phone", "note", "daily_cap"]) {
+    if (b[k] !== undefined) patch[k] = b[k];
+  }
+  /* Moved town: put it back on the map, or distance silently keeps measuring
+     from where it used to be. */
+  if (patch.zip && patch.zip !== shop.zip) {
+    const at = zipPoint(patch.zip);
+    patch.lat = at?.lat ?? null;
+    patch.lon = at?.lon ?? null;
+  }
+  if (Object.keys(patch).length) {
+    patch.updated_at = new Date();
+    await sql`update shops set ${sql(patch)} where id = ${shop.id}`;
+  }
+
+  /* Aisles are a list, so they are replaced wholesale — but only the ones that
+     actually changed, because dropping an aisle a follower has switched on is
+     a thing to do deliberately rather than as a side effect of renaming the
+     shop. The follow rows keep their aisle names; an aisle that no longer
+     exists simply never matches a post again. */
+  if (b.aisles) {
+    const want = [...new Set(b.aisles.map((x) => x.trim()).filter(Boolean))];
+    if (!want.length) return fail(c, 400, "a shop needs at least one aisle");
+    await sql`delete from shop_aisles where shop_id = ${shop.id}`;
+    await sql`insert into shop_aisles ${sql(
+      want.map((aisle, position) => ({ shop_id: shop.id, aisle, position })))}`;
+  }
+
+  const [fresh] = await sql`select * from shops where id = ${shop.id}`;
+  const aisles = (await sql`
+    select aisle from shop_aisles where shop_id = ${shop.id} order by position`)
+    .map((r) => r.aisle);
+  return c.json({ shop: { ...fresh, aisles } });
+});
+
+/* The owner's own name, which is all there is to an account here: sign-in is a
+   emailed link, so there is no password to change and nothing else stored. */
+app.patch("/v1/owner/me", async (c) => {
+  const owner = await needOwner(c);
+  const b = parse(z.object({ name: z.string().min(1).max(80).nullable() }),
+                  await c.req.json());
+  const [me] = await sql`
+    update owners set name = ${b.name} where id = ${owner.id}
+    returning id, email, name`;
+  return c.json({ owner: me });
+});
+
+/* ------------------------------------------- moderating the ask list -------
+ * Scoped to this shop by construction: a want row belongs to one shop and one
+ * device, so hiding by (shop, norm) cannot touch another shop's list. The same
+ * shopper asking the same thing of a different shop keeps it. Hidden rather
+ * than deleted so the same device cannot simply re-add it a moment later. */
+app.delete("/v1/owner/shops/:slug/wants/:norm", async (c) => {
+  const owner = await needOwner(c);
+  const shop = await needShop(c, owner);
+  const [{ norm }] = await sql`select norm_item(${c.req.param("norm")}) as norm`;
+  if (!norm) return fail(c, 400, "nothing to remove");
+  const rows = await sql`
+    update wants set hidden_at = now(), alert = false
+     where shop_id = ${shop.id} and norm = ${norm} and hidden_at is null
+     returning id`;
+  if (!rows.length) return fail(c, 404, "that is not on this shop's list");
+  return c.json({ removed: norm, shoppers: rows.length });
+});
+
+/* ------------------------------------------------ what has happened --------
+ * Derived from rows that already carry their own timestamps rather than from a
+ * separate log: posts published, followers arriving, items asked for. The old
+ * version of this panel was built in the browser from whatever that session
+ * happened to see, so it showed one person their own actions and forgot them
+ * on reload.
+ *
+ * What this cannot show is an edit or a take-down, because nothing records
+ * when those happened — only the current state is stored. Rather than invent a
+ * plausible-looking line for them, they are simply absent. */
+app.get("/v1/owner/shops/:slug/activity", async (c) => {
+  const owner = await needOwner(c);
+  const shop = await needShop(c, owner);
+  const rows = await sql`
+    (select 'post' as type, p.created_at as at, p.name as what,
+            p.kind as detail, p.status as extra
+       from posts p where p.shop_id = ${shop.id}
+       order by p.created_at desc limit 40)
+    union all
+    (select 'follow', f.created_at, null, null, null
+       from follows f where f.shop_id = ${shop.id}
+       order by f.created_at desc limit 40)
+    union all
+    (select 'want', w.created_at, w.label, w.aisle, null
+       from wants w where w.shop_id = ${shop.id} and w.hidden_at is null
+       order by w.created_at desc limit 40)
+    order by at desc limit 40`;
+  return c.json({ activity: rows });
 });
 
 app.get("/v1/owner/shops/:slug/catalog/:gtin", async (c) => {
@@ -1160,7 +1348,33 @@ async function applySchema() {
 }
 export const schemaStatus = () => schemaState;
 
+/* Posts end by themselves.
+ *
+ * Checked on every read as well, because a timer that is a minute behind must
+ * never be the reason a shopper is shown a sale that is over. This exists so
+ * the status is also correct when NOBODY is reading — the owner's list, the
+ * ledger and anything looking at the table directly all see the truth without
+ * someone having to open the app first. */
+/* A minute is a good trade: the read-time check already means nobody is ever
+   SHOWN something stale, so this only decides how quickly the stored status
+   catches up for anyone reading the table directly. Overridable so a test can
+   prove the timer fires without sitting for a minute to watch it. */
+const SWEEP_MS = Math.max(200, Number(process.env.POSTS_SWEEP_MS) || 60_000);
+async function sweepExpired() {
+  try {
+    const [{ expire_due_posts: n }] = await sql`select expire_due_posts()`;
+    if (n > 0) console.log(`[posts] ${n} expired`);
+  } catch (e) {
+    /* Never let this kill the process: a missed sweep is a minute of staleness
+       that the read-time check already covers. */
+    console.error("[posts] sweep failed:", e.message);
+  }
+}
+
 await applySchema();
+await sweepExpired();
+/* unref so the timer never holds the process open on shutdown */
+setInterval(sweepExpired, SWEEP_MS).unref();
 placeUnplacedShops();
 
 const port = Number(process.env.PORT || 8787);

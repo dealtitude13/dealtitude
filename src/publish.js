@@ -72,6 +72,7 @@ export async function publish(shopId, input, postedBy = null) {
       was_cents: input.was_cents ?? null,
       now_cents: input.now_cents ?? null,
       ends: input.ends ?? null,
+      ends_at: input.ends_at ? new Date(input.ends_at) : null,
       posted_by: postedBy,
     })} returning *`;
 
