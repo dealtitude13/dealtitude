@@ -661,3 +661,39 @@ create index if not exists deliveries_device_live_idx
 alter table invites drop constraint if exists invites_accepted_by_fkey;
 alter table invites add constraint invites_accepted_by_fkey
   foreign key (accepted_by) references owners(id) on delete set null;
+
+-- ------------------------------------------------------------ opening hours
+-- Hours were one free-text line on the shop: "Mon–Sat, 9:00 AM – 8:00 PM".
+-- Two things were wrong with that.
+--
+-- A shop that opens later at the weekend had no way to say so — the one line
+-- has to be true for every day or true for none, and most shops are the former
+-- only by accident. And because the line is prose, the app had to guess at it:
+-- a regex took the part after a dash to print "open till 8:00 PM" on the shop
+-- card, which on a Sunday was a sentence the shop never wrote and did not mean.
+--
+-- One row per weekday instead. A missing row means nothing has been said about
+-- that day, which is different from being shut: shops created before this keep
+-- their prose line and get no rows, so the app falls back to showing it rather
+-- than inventing a week they never entered.
+create table if not exists shop_hours (
+  shop_id  uuid not null references shops(id) on delete cascade,
+  -- 0 = Sunday, matching JavaScript's getDay() so no screen has to convert
+  dow      smallint not null check (dow between 0 and 6),
+  closed   boolean not null default false,
+  -- Null when closed. A time, not a timestamp: it is 9am in the shop's own
+  -- town every day, and attaching a date to that only invites a timezone bug.
+  opens    time,
+  closes   time,
+  primary key (shop_id, dow),
+  -- Open days need both ends. Half a range cannot be rendered or compared, and
+  -- a row that passes a check but cannot be displayed is worse than a refusal.
+  constraint shop_hours_range check (closed or (opens is not null and closes is not null))
+);
+
+-- shops.hours stays, as the one-line summary built from these rows. Everything
+-- that only wants to print a line — a shop card, an admin list, the owner's
+-- header — keeps reading it with no change, and a shop with no rows keeps
+-- whatever prose it already had.
+comment on column shops.hours is
+  'Display summary. Built from shop_hours when rows exist; free text otherwise.';

@@ -5,6 +5,7 @@ import { cors } from "hono/cors";
 import { z } from "zod";
 import { sql, healthy } from "./db.js";
 import { zipPoint, milesBetween, knownZip } from "./geo.js";
+import { summarise as summariseHours } from "./hours.js";
 import { publish } from "./publish.js";
 import { publicKey, pushConfigured, backends } from "./push.js";
 import {
@@ -18,7 +19,7 @@ import {
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-18a";
+const BUILD = "2026-10-19a";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -570,7 +571,20 @@ const oldEnough = (device, shop) =>
 
 /* ----------------------------------------------------------------- shops -- */
 const shopShape = sql`
-  s.id, s.slug, s.name, s.address, s.town, s.zip, s.hours, s.daily_cap, s.min_age`;
+  s.id, s.slug, s.name, s.address, s.town, s.zip, s.hours, s.daily_cap, s.min_age,
+  /* The week rides with every shop, not only with the one-shop page.
+     It was on the page alone at first, which left the NEARBY LIST — the screen
+     a shopper actually scans before deciding where to drive — still reading a
+     closing time out of the prose summary. On a shop with weekend hours that
+     line now has several parts, so the old regex returned whichever fragment
+     happened to follow a dash. Cards print the real day instead.
+     to_char so a time arrives as "09:00" rather than "09:00:00", and '[]' for
+     a shop that has never set a week, which the app reads as "fall back". */
+  coalesce((select json_agg(json_build_object(
+              'dow', h.dow, 'closed', h.closed,
+              'opens', to_char(h.opens, 'HH24:MI'),
+              'closes', to_char(h.closes, 'HH24:MI')) order by h.dow)
+              from shop_hours h where h.shop_id = s.id), '[]') as hours_rows`;
 
 /* Shops near a ZIP, by actual distance.
  *
@@ -1135,7 +1149,16 @@ app.get("/v1/owner/shops", async (c) => {
     select s.slug, s.name, s.address, s.town, s.zip, s.hours, s.lat, s.lon,
            s.daily_cap, s.min_age, m.role,
            coalesce((select array_agg(a.aisle order by a.position, a.aisle)
-                       from shop_aisles a where a.shop_id = s.id), '{}') as aisles
+                       from shop_aisles a where a.shop_id = s.id), '{}') as aisles,
+           /* The week, so the hours editor opens on what this shop actually
+              says rather than having to ask for it separately. Empty for a
+              shop whose hours were only ever the one prose line. */
+           coalesce((select json_agg(json_build_object(
+                       'dow', h.dow, 'closed', h.closed,
+                       'opens', to_char(h.opens, 'HH24:MI'),
+                       'closes', to_char(h.closes, 'HH24:MI'))
+                     order by h.dow)
+                       from shop_hours h where h.shop_id = s.id), '[]') as hours_rows
       from memberships m join shops s on s.id = m.shop_id
      where m.owner_id = ${owner.id} and s.active order by s.name`;
   /* Say who is asking. A client restoring a 60-day session has the token but
@@ -1298,6 +1321,15 @@ const ShopEdit = z.object({
   note:      z.string().max(280).nullable().optional(),
   daily_cap: z.number().int().min(1).max(10).optional(),
   aisles:    z.array(z.string().min(1).max(40)).max(24).optional(),
+  /* The whole week or nothing. A partial update would leave the summary line
+     describing days the caller never sent, and a shop's door hours are read
+     and edited as one thing anyway. */
+  hours_rows: z.array(z.object({
+    dow:    z.number().int().min(0).max(6),
+    closed: z.boolean().default(false),
+    opens:  z.string().regex(/^\d{2}:\d{2}$/).nullable().optional(),
+    closes: z.string().regex(/^\d{2}:\d{2}$/).nullable().optional(),
+  })).max(7).optional(),
 });
 
 app.patch("/v1/owner/shops/:slug", async (c) => {
@@ -1308,6 +1340,32 @@ app.patch("/v1/owner/shops/:slug", async (c) => {
   const patch = {};
   for (const k of ["name", "address", "town", "zip", "hours", "phone", "note", "daily_cap"]) {
     if (b[k] !== undefined) patch[k] = b[k];
+  }
+
+  /* The week, when it was sent. Replaced wholesale: these seven rows are one
+     answer to one question, and merging a partial week into an existing one
+     produces a door sign nobody wrote.
+
+     The summary line is rebuilt from the rows here rather than accepted from
+     the caller, so the line and the week can never contradict each other —
+     which they would the first time somebody edited one and not the other. */
+  if (b.hours_rows) {
+    const rows = b.hours_rows.map((r) => ({
+      shop_id: shop.id,
+      dow: r.dow,
+      closed: Boolean(r.closed),
+      /* A closed day keeps no times. Leaving yesterday's times on it is how a
+         shop ends up shut at 9am according to one column and open according
+         to another. */
+      opens: r.closed ? null : (r.opens ?? null),
+      closes: r.closed ? null : (r.closes ?? null),
+    }));
+    const bad = rows.find((r) => !r.closed && (!r.opens || !r.closes));
+    if (bad) return fail(c, 400, "an open day needs both an opening and a closing time");
+
+    await sql`delete from shop_hours where shop_id = ${shop.id}`;
+    if (rows.length) await sql`insert into shop_hours ${sql(rows)}`;
+    patch.hours = summariseHours(rows) || null;
   }
   /* Moved town: put it back on the map, or distance silently keeps measuring
      from where it used to be. */
