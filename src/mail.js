@@ -188,3 +188,165 @@ export async function sendInviteLink(email, link, shopName, days = 7) {
     return { sent: false, reason: "network", detail: e.message };
   }
 }
+
+/* -------------------------------------------------- keeping your follows ----
+ * Two emails for the one thing a shopper has no other way to do: carry their
+ * follows onto a different phone.
+ *
+ * Both are written for someone who never made an account and may not remember
+ * agreeing to anything. So each says plainly what Dealtitude is, that this is
+ * the only thing the address is used for, and that ignoring it costs nothing.
+ * An email that reads like a password reset for an account they never opened is
+ * an email that gets reported as spam, and that damages the sending domain for
+ * every shop on the platform.
+ */
+
+function recoveryBody(link) {
+  const text = [
+    "You asked Dealtitude to remember this address.",
+    "",
+    "Confirm it and the shops you follow can be restored if you ever change",
+    "phones. Until you confirm, it isn't used for anything.",
+    "",
+    link,
+    "",
+    "This is the only thing we use this address for. We won't send you deals,",
+    "and no shop ever sees it.",
+    "If you didn't ask for this, ignore it — nothing has been saved.",
+  ].join("\n");
+
+  const html = `<!doctype html><html><body style="margin:0;padding:24px;
+  background:#F5EFE4;font-family:Helvetica,Arial,sans-serif;color:#1A1410">
+  <div style="max-width:440px;margin:0 auto;background:#FFFDF8;border-radius:14px;
+    padding:28px 24px;border:1px solid #DED3C2">
+    <div style="font-size:13px;font-weight:700;letter-spacing:.08em;color:#7A6E62;
+      text-transform:uppercase">Dealtitude</div>
+    <div style="font-size:21px;font-weight:800;margin:14px 0 8px;letter-spacing:-.02em">
+      Confirm this address</div>
+    <div style="font-size:15px;line-height:1.5;margin-bottom:18px">
+      Confirm it and the shops you follow can be restored if you ever change
+      phones. Until you confirm, it isn't used for anything.</div>
+    <a href="${link}" style="display:inline-block;background:#2E7D5B;color:#fff;
+      text-decoration:none;font-weight:800;font-size:16px;padding:13px 22px;
+      border-radius:10px">Confirm my address</a>
+    <div style="font-size:12.5px;line-height:1.55;color:#7A6E62;margin-top:22px">
+      If the button doesn't work, copy this address into your browser:<br>
+      <span style="word-break:break-all;color:#2E7D5B">${link}</span>
+    </div>
+    <div style="font-size:12.5px;line-height:1.55;color:#7A6E62;margin-top:18px;
+      padding-top:16px;border-top:1px solid #F2ECE1">
+      This is the only thing we use your address for. We won't send you deals,
+      and no shop ever sees it. If you didn't ask for this, ignore it — nothing
+      has been saved.
+    </div>
+  </div></body></html>`;
+
+  return { text, html };
+}
+
+/** Confirm a recovery address. Never throws. */
+export async function sendRecoveryConfirm(email, link) {
+  if (!KEY) {
+    console.log(`[recovery] confirm link for ${email}: ${link}`);
+    return { sent: false, reason: "no_mail_key" };
+  }
+  const { text, html } = recoveryBody(link);
+  try {
+    const res = await fetch(ENDPOINT, {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        from: FROM, to: [email], subject: "Confirm your Dealtitude address",
+        text, html, ...(REPLY_TO ? { reply_to: REPLY_TO } : {}),
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.error("[mail] recovery confirm failed", res.status, body.slice(0, 300));
+      console.log(`[recovery] confirm link for ${email}: ${link}`);
+      return { sent: false, reason: `resend_${res.status}`, detail: body.slice(0, 200) };
+    }
+    return { sent: true };
+  } catch (e) {
+    console.error("[mail] recovery confirm threw", e.message);
+    console.log(`[recovery] confirm link for ${email}: ${link}`);
+    return { sent: false, reason: "network", detail: e.message };
+  }
+}
+
+function restoreBody(link, code) {
+  const text = [
+    "Here are your follows.",
+    "",
+    "Open this link on your new phone and the shops you follow — and the aisles",
+    "you picked — come back with it:",
+    link,
+    "",
+    `Already installed the Dealtitude app? Open it, go to the You tab, choose`,
+    `"I have a code" and type: ${code}`,
+    "",
+    "This works once and expires in 2 hours.",
+    "If you didn't ask for it, ignore it — nothing has changed.",
+  ].join("\n");
+
+  const html = `<!doctype html><html><body style="margin:0;padding:24px;
+  background:#F5EFE4;font-family:Helvetica,Arial,sans-serif;color:#1A1410">
+  <div style="max-width:440px;margin:0 auto;background:#FFFDF8;border-radius:14px;
+    padding:28px 24px;border:1px solid #DED3C2">
+    <div style="font-size:13px;font-weight:700;letter-spacing:.08em;color:#7A6E62;
+      text-transform:uppercase">Dealtitude</div>
+    <div style="font-size:21px;font-weight:800;margin:14px 0 8px;letter-spacing:-.02em">
+      Here are your follows</div>
+    <div style="font-size:15px;line-height:1.5;margin-bottom:18px">
+      Open this on your new phone and the shops you follow — and the aisles you
+      picked — come back with it.</div>
+    <a href="${link}" style="display:inline-block;background:#FF9F1C;color:#1A1410;
+      text-decoration:none;font-weight:800;font-size:16px;padding:13px 22px;
+      border-radius:10px">Restore my follows</a>
+    <div style="font-size:13px;line-height:1.55;color:#7A6E62;margin-top:22px;
+      padding-top:16px;border-top:1px solid #F2ECE1">
+      Already have the Dealtitude app installed? Open it, go to the
+      <b style="color:#1A1410">You</b> tab, choose "I have a code" and type:
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:20px;
+        font-weight:600;letter-spacing:.12em;color:#1A1410;background:#F2ECE1;
+        border-radius:9px;padding:12px;margin-top:10px;text-align:center">${code}</div>
+    </div>
+    <div style="font-size:12.5px;line-height:1.55;color:#7A6E62;margin-top:18px;
+      padding-top:16px;border-top:1px solid #F2ECE1">
+      This works once and expires in 2 hours. If you didn't ask for it, ignore
+      it — nothing has changed.
+    </div>
+  </div></body></html>`;
+
+  return { text, html };
+}
+
+/** Send a new phone its way back. Never throws, and never says who it found. */
+export async function sendRestoreLink(email, link, code) {
+  if (!KEY) {
+    console.log(`[recovery] restore link for ${email}: ${link}`);
+    return { sent: false, reason: "no_mail_key" };
+  }
+  const { text, html } = restoreBody(link, code);
+  try {
+    const res = await fetch(ENDPOINT, {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        from: FROM, to: [email], subject: "Restore your Dealtitude follows",
+        text, html, ...(REPLY_TO ? { reply_to: REPLY_TO } : {}),
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.error("[mail] restore failed", res.status, body.slice(0, 300));
+      console.log(`[recovery] restore link for ${email}: ${link}`);
+      return { sent: false, reason: `resend_${res.status}`, detail: body.slice(0, 200) };
+    }
+    return { sent: true };
+  } catch (e) {
+    console.error("[mail] restore threw", e.message);
+    console.log(`[recovery] restore link for ${email}: ${link}`);
+    return { sent: false, reason: "network", detail: e.message };
+  }
+}

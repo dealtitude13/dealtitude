@@ -591,3 +591,73 @@ language sql stable as $$
    group by w.norm
    order by count(*) desc, max(w.created_at) desc
 $$;
+
+-- ------------------------------------------------- getting your follows back
+-- A shopper has no account, and that is deliberate: following a shop costs one
+-- tap and no personal details, which is the whole reason anyone does it from a
+-- sign taped to a counter. The cost is that the phone IS the identity, so a new
+-- phone arrives as a stranger and the shop silently loses a follower.
+--
+-- This is the opt-in way back, and it stays opt-in. One address, given by
+-- someone who wants it, used for exactly two things: confirming it works, and
+-- emailing a restore link to it later. It is never required to follow a shop,
+-- never shown to a shop, and never counted in anything an owner sees.
+--
+-- Unverified is treated as absent. Otherwise a typo'd address would hand a
+-- stranger a link to somebody else's follows, and the person who mistyped it
+-- would never find out.
+alter table devices add column if not exists recovery_email      text;
+alter table devices add column if not exists recovery_verified_at timestamptz;
+alter table devices add column if not exists recovery_token_hash  text;
+alter table devices add column if not exists recovery_sent_at     timestamptz;
+
+-- Restore looks a device up BY address, so that lookup needs an index. Lowered
+-- because addresses are compared case-insensitively; a partial index because
+-- only verified rows are ever searched.
+create index if not exists devices_recovery_idx
+  on devices (lower(recovery_email))
+  where recovery_email is not null and recovery_verified_at is not null;
+
+-- The verify token is single-use and short-lived, so it gets its own index
+-- rather than sharing the device lookup.
+create index if not exists devices_recovery_token_idx
+  on devices (recovery_token_hash) where recovery_token_hash is not null;
+
+-- ------------------------------------------------------ deleting an account
+-- Apple requires an app that creates accounts to let people delete them, and
+-- its own guidance extends that to accounts created automatically. A shopper
+-- never signs up for anything, but the app still makes a device row for their
+-- phone and hangs their follows, their requests and their delivery history off
+-- it. That is the kind of record the rule is about, so it has to be deletable
+-- from inside the app.
+--
+-- The conflict is in the delivery ledger. It was ON DELETE CASCADE, so erasing
+-- one shopper also erased every "sent to 12 people" a shop had ever earned —
+-- quietly rewriting history that belongs to the shop, not to the shopper.
+--
+-- SET NULL instead. The row survives with no one attached to it, so a shop
+-- keeps its counts and the shopper keeps nothing. That is exactly the promise
+-- the app already makes to both sides: a shop is told how many, never who.
+alter table deliveries alter column device_id drop not null;
+alter table deliveries drop constraint if exists deliveries_device_id_fkey;
+alter table deliveries add constraint deliveries_device_id_fkey
+  foreign key (device_id) references devices(id) on delete set null;
+
+-- Reading the ledger as a shopper must never match a detached row. Every such
+-- query filters on device_id, and NULL never equals anything, so this holds on
+-- its own — the index is here so those lookups stay cheap once the table has
+-- detached rows in it.
+create index if not exists deliveries_device_live_idx
+  on deliveries (device_id, sent_at desc) where device_id is not null;
+
+-- An accepted invite points at the owner who accepted it, and that reference
+-- used to restrict outright — so closing an account failed for every owner who
+-- had ever accepted one, which is every owner there is. The route reported the
+-- constraint's own words and deleted nothing.
+--
+-- SET NULL, for the same reason as the ledger above: the invite was accepted,
+-- that happened, and the record of it is the shop's. Only the pointer at a
+-- person goes.
+alter table invites drop constraint if exists invites_accepted_by_fkey;
+alter table invites add constraint invites_accepted_by_fkey
+  foreign key (accepted_by) references owners(id) on delete set null;

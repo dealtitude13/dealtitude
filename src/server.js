@@ -10,12 +10,15 @@ import { publicKey, pushConfigured, backends } from "./push.js";
 import {
   newToken, store, deviceFrom, ownerFrom, holdsShop, isAdmin, adminKeySet,
 } from "./auth.js";
-import { sendSignInLink, sendInviteLink, mailConfigured } from "./mail.js";
+import {
+  sendSignInLink, sendInviteLink, sendRecoveryConfirm, sendRestoreLink,
+  mailConfigured,
+} from "./mail.js";
 
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-17a";
+const BUILD = "2026-10-18a";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -247,6 +250,232 @@ app.post("/v1/device/claim", async (c) => {
       from follows f join shops s on s.id = f.shop_id
      where f.device_id = ${claim.device_id} and s.active`;
   return c.json({ device_id: claim.device_id, token, follows });
+});
+
+/* ----------------------------------------------- getting your follows back --
+ * The same claim machinery as above, reached from an email instead of from the
+ * address bar — which is what turns a one-off install trick into an answer to
+ * "I got a new phone".
+ *
+ * Deliberately NOT an account. One optional address, no password, no name, and
+ * no effect on anything a shop sees. A shopper who skips this loses nothing
+ * they have today; a shopper who fills it in can get their follows back.
+ *
+ * Three rules hold this together:
+ *   - Unverified is absent. A mistyped address must never receive somebody
+ *     else's follows, and the person who mistyped it would never know.
+ *   - The restore route is unauthenticated, because a new phone has nothing to
+ *     authenticate with. So it must never confirm whether an address is known.
+ *   - It sends mail to an address supplied by the caller, so it is rate
+ *     limited well below the global ceiling.
+ */
+
+/* .trim() before .email(), not after: a phone keyboard adds a trailing space
+   often enough that validating the raw string first turned an ordinary typing
+   habit into "Invalid email address" with nothing on screen to explain it. */
+const RecoveryIn = z.object({ email: z.string().trim().email().max(200) });
+
+/** What this phone has set up, so Settings can show the real state. */
+app.get("/v1/device/recovery", async (c) => {
+  const d = await deviceFrom(c);
+  if (!d) return fail(c, 401, "unknown device");
+  return c.json({
+    email: d.recovery_email || null,
+    verified: Boolean(d.recovery_verified_at),
+  });
+});
+
+/** Save or change the address, and send the confirmation that verifies it. */
+app.post("/v1/device/recovery", async (c) => {
+  const d = await deviceFrom(c);
+  if (!d) return fail(c, 401, "unknown device");
+  const b = parse(RecoveryIn, await c.req.json());
+  const email = b.email.trim().toLowerCase();
+
+  /* Re-saving the same address re-sends the confirmation rather than silently
+     doing nothing — "it never arrived" is the common case, not a changed mind.
+     A fresh token each time means the previous email stops working, which is
+     what you want if the first one went to the wrong place. */
+  const token = newToken();
+  await sql`update devices
+               set recovery_email = ${email},
+                   recovery_verified_at = null,
+                   recovery_token_hash = ${store(token)},
+                   recovery_sent_at = now()
+             where id = ${d.id}`;
+
+  /* Built from this server's own address rather than the website's, so
+     confirming needs no new page deployed anywhere — the route below answers
+     with a small page of its own. */
+  const origin = (() => {
+    try { return new URL(c.req.url).origin; } catch { return process.env.APP_URL || ""; }
+  })();
+  const link = `${origin}/v1/device/recovery/verify?t=${token}`;
+  const mail = await sendRecoveryConfirm(email, link);
+
+  /* Same reasoning as the owner sign-in route: the link comes back in the body
+     only on a server with no mail sender that is not production, so a pilot can
+     run before the mail domain is verified. */
+  const showLink = !mailConfigured && process.env.NODE_ENV !== "production";
+  return c.json({ ok: true, email, sent: mail.sent, can_send: mailConfigured,
+                  ...(showLink ? { link } : {}) });
+});
+
+/** Stop keeping the address. Everything else about the phone is untouched. */
+app.delete("/v1/device/recovery", async (c) => {
+  const d = await deviceFrom(c);
+  if (!d) return fail(c, 401, "unknown device");
+  await sql`update devices
+               set recovery_email = null, recovery_verified_at = null,
+                   recovery_token_hash = null, recovery_sent_at = null
+             where id = ${d.id}`;
+  return c.json({ ok: true });
+});
+
+/* Tapping the confirmation. A GET, because it is a link in an email, and the
+   only thing it changes is this one flag — there is nothing here worth a
+   cross-site request. Single use: the token is spent on arrival. */
+app.get("/v1/device/recovery/verify", async (c) => {
+  const t = c.req.query("t") || "";
+  const [d] = t ? await sql`
+    update devices
+       set recovery_verified_at = now(), recovery_token_hash = null
+     where recovery_token_hash = ${store(t)}
+       and recovery_sent_at > now() - interval '7 days'
+     returning id, recovery_email` : [];
+
+  /* A person is looking at this in a mail app's browser, so it answers in
+     words rather than JSON. Nothing here needs the app to be installed. */
+  const page = (head, body) => c.html(`<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dealtitude</title></head>
+<body style="margin:0;padding:28px 18px;background:#F5EFE4;
+  font-family:-apple-system,Helvetica,Arial,sans-serif;color:#1A1410">
+<div style="max-width:420px;margin:40px auto;background:#FFFDF8;border:1px solid #DED3C2;
+  border-radius:14px;padding:26px 22px;text-align:center">
+  <div style="font-size:12px;font-weight:700;letter-spacing:.09em;color:#7A6E62;
+    text-transform:uppercase">Dealtitude</div>
+  <div style="font-size:21px;font-weight:800;margin:14px 0 10px;letter-spacing:-.02em">${head}</div>
+  <div style="font-size:15px;line-height:1.55;color:#7A6E62">${body}</div>
+</div></body></html>`, d ? 200 : 404);
+
+  if (!d) {
+    return page("That link has expired",
+      "Open Dealtitude, go to the You tab and save your email again — a fresh " +
+      "link will arrive in a moment.");
+  }
+  return page("Your follows are protected",
+    "If you ever change phones, ask for a restore link at this address and the " +
+    "shops you follow will come back. You can close this page.");
+});
+
+/**
+ * The new phone. Unauthenticated by necessity, so it is careful.
+ *
+ * Always answers the same way whether or not the address is known. The code it
+ * creates is the ordinary claim code: short-lived, single use, and worth only
+ * the follows of the phone that address belongs to.
+ */
+const restoreHits = new Map();
+app.post("/v1/device/restore", async (c) => {
+  const b = parse(RecoveryIn, await c.req.json());
+  const email = b.email.trim().toLowerCase();
+
+  /* Per-address, not per-IP: the thing being protected is somebody's inbox,
+     and a shared network should not stop a second person restoring. */
+  const now = Date.now();
+  const rec = restoreHits.get(email) || { n: 0, until: now + 3_600_000 };
+  if (now > rec.until) { rec.n = 0; rec.until = now + 3_600_000; }
+  rec.n++; restoreHits.set(email, rec);
+  if (restoreHits.size > 5000) restoreHits.clear();
+  /* Still a 200. A 429 here would confirm the address exists. */
+  if (rec.n > Number(process.env.RESTORE_PER_HOUR || 5)) return c.json({ ok: true });
+
+  /* The most recently used phone with that address. More than one is normal —
+     someone who did this on an old phone and again on its replacement — and
+     the newest is the one with the follows they expect. */
+  const [d] = await sql`
+    select id from devices
+     where lower(recovery_email) = ${email}
+       and recovery_verified_at is not null
+     order by last_seen_at desc
+     limit 1`;
+  if (!d) return c.json({ ok: true });              // says nothing either way
+
+  const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  const code = Array.from(randomBytes(10))
+    .map((n) => alphabet[n % alphabet.length]).join("");
+  await sql`insert into device_claims (code, device_id, expires_at)
+            values (${code}, ${d.id}, now() + interval '2 hours')`;
+
+  /* The app reads a claim code out of the hash already — the same path the
+     home-screen handoff uses — so this link needs no new handling in the app.
+
+     The code is sent in the clear beside the link on purpose. Someone who has
+     already installed the app from the App Store would otherwise tap the link
+     and land in Safari instead of in the app they are holding; typing ten
+     characters into the You tab gets them there with no deep-link setup. */
+  await sendRestoreLink(email, `${process.env.APP_URL || ""}/#c=${code}`, code);
+  return c.json({ ok: true });
+});
+
+/* ------------------------------------------------------ deleting yourself --
+ * A shopper erasing their own record.
+ *
+ * Required by the App Store, and right anyway: the app created this record
+ * without ever asking anyone to sign up, so it has to be removable without
+ * asking anyone to get in touch.
+ *
+ * What goes: the device row, and by cascade every follow, every aisle choice,
+ * every item they asked for, and any outstanding restore code. The recovery
+ * address goes with the row.
+ *
+ * What stays: the delivery rows, detached. They are the shops' record of how
+ * many phones an announcement reached, and that number is not the shopper's to
+ * take away — but with device_id set to NULL there is nothing in it that points
+ * at a person, and no query that reads the ledger as a shopper can match it.
+ */
+app.delete("/v1/me", async (c) => {
+  const d = await deviceFrom(c);
+  /* An unknown token is the state someone is asking for, so it is a success.
+     Reporting 401 here would leave a shopper who tapped twice believing their
+     data is still somewhere. */
+  if (!d) return c.json({ deleted: true, follows: 0, wants: 0 });
+
+  const [counts] = await sql`
+    select (select count(*) from follows where device_id = ${d.id}) as follows,
+           (select count(*) from wants   where device_id = ${d.id}) as wants`;
+
+  await sql`delete from devices where id = ${d.id}`;
+  console.log(`[delete] device ${d.id} removed at its own request`);
+  return c.json({ deleted: true,
+                  follows: Number(counts.follows),
+                  wants: Number(counts.wants) });
+});
+
+/* An owner closing their account.
+ *
+ * Their shops are NOT deleted. A shop exists on the platform independently of
+ * whoever happens to run it: a shopkeeper handing the business on, or walking
+ * away from it, must not take its followers with them. The membership is what
+ * goes, so the shop reverts to having nobody running it and can be invited to
+ * someone else — which is exactly what happens before its first owner accepts.
+ */
+app.delete("/v1/owner/me", async (c) => {
+  const owner = await ownerFrom(c);
+  if (!owner) return c.json({ deleted: true, shops: 0 });
+
+  const [counts] = await sql`
+    select (select count(*) from memberships where owner_id = ${owner.id}) as shops`;
+
+  /* Sessions and memberships cascade from the owner row. Invites written to
+     that address are cleared too, or the next person to sign in with it would
+     silently inherit shops the previous holder had been invited to. */
+  await sql`delete from invites where email = ${owner.email} and accepted_at is null`;
+  await sql`delete from login_links where email = ${owner.email}`;
+  await sql`delete from owners where id = ${owner.id}`;
+  console.log(`[delete] owner ${owner.email} closed their account`);
+  return c.json({ deleted: true, shops: Number(counts.shops) });
 });
 
 /* A browser may rotate a subscription without being asked. The phone keeps its
@@ -646,11 +875,47 @@ app.get("/v1/me/follows", async (c) => {
   return c.json({ follows: rows });
 });
 
+/* ------------------------------------------------- what reached this phone --
+ * The Alerts tab used to be filled by the demo walkthrough and by nothing else
+ * — in the live app `setInbox` was never called, so it promised "anything a
+ * shop you follow sends will appear here" and then showed an empty screen
+ * forever.
+ *
+ * The data was already here. Every send is written to `deliveries`, which is
+ * the same ledger the owner's "sent" counts come from. This is that ledger from
+ * the other end.
+ *
+ * Only what actually WENT is listed. Rows withheld by the aisle filter or the
+ * daily cap are deliberately left out: a shopper reading "we decided not to
+ * tell you about this" is being shown a decision they did not ask to see, and
+ * it invites exactly the question the cap exists to avoid. */
+app.get("/v1/me/alerts", async (c) => {
+  const device = await need(c);
+  const rows = await sql`
+    select d.sent_at, d.opened_at,
+           p.id as post_id, p.kind, p.aisle, p.name, p.note,
+           p.was_cents, p.now_cents, p.status,
+           s.slug, s.name as shop_name
+      from deliveries d
+      join posts p on p.id = d.post_id
+      /* Deliberately NOT joined on s.active.
+         This is the shopper's own record of what was sent to their phone, and
+         taking a shop off the app is not a reason to erase it. The filter used
+         to be here, which meant a shop being removed silently emptied the
+         Alerts tab of every alert it had ever sent — alerts kept arriving and
+         the screen stayed blank for good, with nothing to explain it. The
+         shop's name is still shown; only its listing is gone. */
+      join shops s on s.id = d.shop_id
+     where d.device_id = ${device.id} and d.withheld is null
+     order by d.sent_at desc limit 50`;
+  return c.json({ alerts: rows });
+});
+
 app.get("/v1/me/feed", async (c) => {
   const device = await need(c);
   const rows = await sql`
     select p.id, p.kind, p.aisle, p.name, p.note, p.was_cents, p.now_cents,
-           p.ends, p.created_at, s.slug, s.name as shop_name
+           p.ends, p.ends_at, p.status, p.created_at, s.slug, s.name as shop_name
       from posts p
       join follows f on f.shop_id = p.shop_id and f.device_id = ${device.id}
       /* Joined on active: a shop taken off the app stops reaching the phones
@@ -658,8 +923,18 @@ app.get("/v1/me/feed", async (c) => {
          them back. Backticks are deliberately absent from this comment — it
          sits inside a template literal, where one would end the query. */
       join shops s on s.id = p.shop_id and s.active
-     where p.status = 'active'
-       and (p.ends_at is null or p.ends_at > now())
+       /* Live posts, plus the ones that have just ended.
+          A sale vanishing the moment it expires leaves a shopper unable to
+          tell "it's over" from "I imagined it" — and they ask the shop, which
+          is the shop's problem then. Two days of ended posts, marked as ended,
+          answers it. The app renders anything not active as plainly over; the
+          one thing this must never cause is somebody walking to a shop for a
+          sale that finished yesterday, so the status travels with the row and
+          the screen leads with it. */
+     where (
+         (p.status = 'active' and (p.ends_at is null or p.ends_at > now()))
+         or coalesce(p.ends_at, p.created_at) > now() - interval '2 days'
+       )
        and (p.kind in ('hours','notice') or p.aisle = any (f.aisles))
        /* An age-restricted shop's posts only appear once this device has
           cleared that shop's bar. A follow made before the gate existed, or a
@@ -1123,7 +1398,29 @@ app.get("/v1/owner/shops/:slug/activity", async (c) => {
        from wants w where w.shop_id = ${shop.id} and w.hidden_at is null
        order by w.created_at desc limit 40)
     order by at desc limit 40`;
-  return c.json({ activity: rows });
+
+  /* Requests the owner took off their own list.
+   *
+   * Hiding one removed it from every screen the owner had, which made a
+   * dismissed request indistinguishable from one that was never made — and the
+   * shopper still has theirs, so the two sides disagreed with nothing on
+   * either screen to explain why. Counted and named here instead, so a
+   * decision stays visible to whoever made it.
+   *
+   * Grouped by norm, like the live list, so one dismissal covers every
+   * spelling of the same item rather than appearing once per shopper. */
+  const removed = await sql`
+    select w.norm,
+           (array_agg(w.label order by w.hidden_at desc))[1] as label,
+           count(*)             as shoppers,
+           max(w.hidden_at)     as at
+      from wants w
+     where w.shop_id = ${shop.id} and w.hidden_at is not null
+     group by w.norm
+     order by max(w.hidden_at) desc
+     limit 30`;
+
+  return c.json({ activity: rows, removed });
 });
 
 app.get("/v1/owner/shops/:slug/catalog/:gtin", async (c) => {
