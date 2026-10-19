@@ -895,7 +895,7 @@ app.get("/v1/me/alerts", async (c) => {
     select d.sent_at, d.opened_at,
            p.id as post_id, p.kind, p.aisle, p.name, p.note,
            p.was_cents, p.now_cents, p.status,
-           s.slug, s.name as shop_name
+           s.slug, s.name as shop_name, s.active as shop_live
       from deliveries d
       join posts p on p.id = d.post_id
       /* Deliberately NOT joined on s.active.
