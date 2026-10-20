@@ -955,3 +955,84 @@ language sql stable as $$
                         and dl.withheld is null
                         and dl.sent_at > now() - interval '30 days'))
 $$;
+
+-- ------------------------------------------------- what a shopkeeper agrees to
+-- A word filter stops the honest mistake. It cannot stop a brand name nobody
+-- wrote down, ordinary speech, or the far larger set of things that are simply
+-- unlawful to advertise. What carries that weight is this: every owner states,
+-- before they can post anything at all, what they will not post.
+--
+-- A row per acceptance rather than a flag on the owner, for two reasons. The
+-- wording will change, and when it does the old acceptance must still say what
+-- was actually agreed to on the day — a boolean cannot. And an owner who holds
+-- several shops agrees once as a person, which is what is being recorded.
+--
+-- accepted_at is the evidence. version is what they accepted. Neither is ever
+-- updated in place.
+create table if not exists owner_terms (
+  owner_id     uuid not null references owners(id) on delete cascade,
+  version      text not null,
+  accepted_at  timestamptz not null default now(),
+  -- The exact words shown on the day, stored with the acceptance. A reference
+  -- to wording held somewhere else is worth nothing a year later when the
+  -- wording has moved on.
+  text         text not null,
+  primary key (owner_id, version)
+);
+create index if not exists owner_terms_owner_idx on owner_terms (owner_id);
+
+-- ------------------------------------------- the box, and what it said
+-- Build 2026-10-20f. The acceptance is now an explicit, unchecked-by-default
+-- tick rather than a button alone, and the words BESIDE the box are part of
+-- what was agreed — so they are stored with it, for the same reason the policy
+-- text is. "They clicked something" is not a record; "they ticked a box that
+-- said this, on this date, against this wording" is.
+--
+-- Defaulted false so the column can be added to a table that already has rows:
+-- an acceptance taken before the box existed must not claim a tick that was
+-- never made. In practice there are none in production, which is the only
+-- reason this is a column rather than a new table.
+alter table owner_terms add column if not exists confirmed  boolean not null default false;
+alter table owner_terms add column if not exists confirm_text text;
+
+-- ---------------------------------------------- blocking, reports, moderation
+-- Build 2026-10-20g.
+--
+-- Item asks are the one place a stranger can put words on another person's
+-- screen. Registering a device takes one unauthenticated request, and the text
+-- typed into the ask box then appears both on the shop owner's metrics screen
+-- and in the suggestion list every shopper sees on that shop's page. The word
+-- filter was on posting, editing, aisles and shop creation, and not on this.
+--
+-- Three things are needed, and they are one feature: a way to refuse the text,
+-- a way for somebody to tell us about what got through, and a way to stop the
+-- device doing it again. A report button with no block behind it is a
+-- suggestion box.
+alter table devices add column if not exists blocked_at timestamptz;
+alter table devices add column if not exists blocked_why text;
+create index if not exists devices_blocked_idx on devices (blocked_at)
+  where blocked_at is not null;
+
+-- What somebody told us about. Kept after it is dealt with, not deleted: the
+-- record that a report came in and what was done about it is the part Apple
+-- asks for, and the part that is worth anything in an argument later.
+--
+-- subject_* rather than a foreign key per kind: a report must survive the thing
+-- it is about being removed, which is the usual outcome of a good report.
+create table if not exists reports (
+  id           uuid primary key default gen_random_uuid(),
+  kind         text not null check (kind in ('post', 'want', 'shop')),
+  shop_id      uuid references shops(id) on delete set null,
+  subject_id   uuid,            -- the post, when it is a post
+  subject_norm text,            -- the normalised item, when it is an ask
+  subject_text text not null,   -- what it SAID, copied at the time it was reported
+  reason       text,            -- what the reporter chose, if they chose
+  note         text,            -- anything they typed
+  by_device    uuid references devices(id) on delete set null,
+  by_owner     uuid references owners(id) on delete set null,
+  created_at   timestamptz not null default now(),
+  resolved_at  timestamptz,
+  action       text             -- what was done: hidden, blocked, removed, none
+);
+create index if not exists reports_open_idx on reports (created_at desc)
+  where resolved_at is null;

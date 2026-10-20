@@ -34,9 +34,21 @@ const bearer = (c) => {
 export async function deviceFrom(c) {
   const token = bearer(c);
   if (!token) return null;
+  /* The touch and the lookup are ONE statement, awaited.
+   *
+   * It used to be a select followed by a fire-and-forget update, which looked
+   * cheaper and was not: two round-trips instead of one, and the write could
+   * still be in flight when the next request read it. That mattered once
+   * last_seen_at stopped being a diagnostic and became evidence — it is what
+   * decides whether a shop is told a follower is confirmed reachable. A number
+   * shown to a shopkeeper should not depend on which query won a race, and an
+   * error swallowed by .catch() would silently under-report it.
+   *
+   * token_hash is unique, so this updates at most one row. */
   const [d] = await sql`
-    select * from devices where token_hash = ${hash(token)} limit 1`;
-  if (d) sql`update devices set last_seen_at = now() where id = ${d.id}`.catch(() => {});
+    update devices set last_seen_at = now()
+     where token_hash = ${hash(token)}
+    returning *`;
   return d || null;
 }
 

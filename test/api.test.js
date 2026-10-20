@@ -133,6 +133,39 @@ let ownerTok;
   const shops = await call("GET", "/v1/owner/shops", { token: ownerTok });
   ok("owner holds exactly that shop", shops.body?.shops?.[0]?.slug === slug);
 
+  /* The undertaking about tobacco, vape and lottery. A post is refused until it
+     is on file, which is the whole reason for recording it — so the test does
+     what a shopkeeper does on their first sign-in, by the same route the screen
+     uses. There is no test-only bypass, deliberately: if one existed, nothing
+     here would prove the gate holds in production. */
+  ok("the terms are offered before anything has been posted",
+     shops.body?.owner?.terms_accepted_at == null
+     && typeof shops.body?.owner?.terms_text === "string"
+     && shops.body.owner.terms_text.length > 100,
+     JSON.stringify(shops.body?.owner).slice(0, 160));
+  ok("the prohibited-products policy is carried verbatim, with its checkbox",
+     /1\. Tobacco and Nicotine Products/.test(shops.body.owner.terms_text)
+     && /2\. Lottery and Gambling Products or Services/.test(shops.body.owner.terms_text)
+     && /3\. Circumvention of Restrictions/.test(shops.body.owner.terms_text)
+     && /read and agree/i.test(shops.body.owner.terms_checkbox || ""),
+     shops.body.owner.terms_text.slice(0, 140));
+  const blocked = await call("POST", `/v1/owner/shops/${slug}/posts`, { token: ownerTok,
+    body: { kind: "notice", name: "Open late tonight" } });
+  ok("and posting is refused until they are accepted", blocked.status === 403,
+     `${blocked.status} ${JSON.stringify(blocked.body)}`);
+  /* The tick is required, and required to be true. The screen's button is dead
+     until the box is ticked, but the screen is not what this has to hold
+     against — a stale bundle or a script would otherwise write down an
+     acceptance nobody ever made. */
+  const noTick = await call("POST", "/v1/owner/terms", { token: ownerTok,
+    body: { version: shops.body.owner.terms_version } });
+  ok("an acceptance with no confirmation tick is refused", noTick.status === 400,
+     `${noTick.status} ${JSON.stringify(noTick.body)}`);
+  const agreed = await call("POST", "/v1/owner/terms", { token: ownerTok,
+    body: { version: shops.body.owner.terms_version, confirmed: true } });
+  ok("the owner's undertaking is recorded", agreed.status === 200
+     && Boolean(agreed.body?.accepted_at), JSON.stringify(agreed.body));
+
   const stranger = await call("POST", "/v1/auth/request", { body: { email: "nobody@test.local" } });
   const st = new URL(stranger.body.link, "http://x").searchParams.get("token");
   const sv = await call("POST", "/v1/auth/verify", { body: { token: st } });

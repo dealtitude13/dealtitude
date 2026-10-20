@@ -6,6 +6,9 @@ import { z } from "zod";
 import { sql, healthy } from "./db.js";
 import { zipPoint, milesBetween, knownZip } from "./geo.js";
 import { summarise as summariseHours } from "./hours.js";
+import { forbidden, forbiddenMessage, forbiddenAskMessage } from "./forbidden.js";
+import { TERMS_VERSION, TERMS_TEXT, TERMS_SUMMARY, TERMS_SECTIONS,
+         TERMS_CHECKBOX } from "./terms.js";
 import { publish } from "./publish.js";
 import { publicKey, pushConfigured, backends } from "./push.js";
 import {
@@ -19,7 +22,7 @@ import {
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-20d";
+const BUILD = "2026-10-20g";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -700,8 +703,23 @@ app.get("/v1/shops/:slug", async (c) => {
 const need = async (c) => {
   const d = await deviceFrom(c);
   if (!d) throw Object.assign(new Error("register this device first"), { status: 401 });
+  /* A blocked phone can still READ — nothing is gained by breaking the app in
+     somebody's hand, and a blank screen only tells them to reinstall. What it
+     cannot do is put words anywhere another person will see them, which is
+     every route that goes through here. */
+  if (d.blocked_at)
+    throw Object.assign(new Error("this device can no longer post to Dealtitude"),
+                        { status: 403 });
   return d;
 };
+
+/* How many item asks one phone may submit in a day.
+ *
+ * A real shopper asks for a handful of things and then stops. The number is
+ * here to make an automated flood expensive, not to ration honest use, so it
+ * sits far above what anybody would hit by hand and far below what a script
+ * would want. */
+const WANTS_PER_DAY = 20;
 
 const FollowIn = z.object({ aisles: z.array(z.string().max(40)).max(40).default([]) });
 
@@ -835,6 +853,25 @@ app.post("/v1/shops/:slug/wants", async (c) => {
 
   const [{ norm }] = await sql`select norm_item(${b.label}) as norm`;
   if (!norm) return fail(c, 400, "say what you're hoping to see");
+
+  /* THE SAME RULE AS POSTING, on the one route a stranger can reach.
+   *
+   * Registering a device needs no invitation and no address, so this box is
+   * the cheapest way to get words onto a shop's page and into the suggestion
+   * list other shoppers see. It was the one door the filter was not on. */
+  const hit = forbidden(b.label);
+  if (hit) {
+    console.warn(`[forbidden] device ${device.id} asked for "${hit.term}" (${hit.category})`);
+    return fail(c, 422, forbiddenAskMessage(hit));
+  }
+
+  /* And a ceiling, because the filter only knows the words it knows. A flood
+     of ordinary-looking nonsense is still a flood. */
+  const [{ today }] = await sql`
+    select count(*)::int as today from wants
+     where device_id = ${device.id} and created_at > now() - interval '24 hours'`;
+  if (today >= WANTS_PER_DAY)
+    return fail(c, 429, "that's a lot of asks for one day \u2014 try again tomorrow");
 
   /* Only an aisle this shop has; otherwise leave it null and let the owner
      file it when he posts. A wrong aisle on a want would route the eventual
@@ -1170,9 +1207,68 @@ app.get("/v1/owner/shops", async (c) => {
   /* Say who is asking. A client restoring a 60-day session has the token but
      not the address it belongs to, and it should not have to keep its own copy
      of that — this is the answer the server already knows. */
-  return c.json({ owner: { id: owner.id, email: owner.email, name: owner.name },
+  /* Whether this owner has agreed to the CURRENT wording. A past acceptance of
+     older words does not count: that is the whole reason the version is part
+     of the key. */
+  const [agreed] = await sql`
+    select accepted_at from owner_terms
+     where owner_id = ${owner.id} and version = ${TERMS_VERSION}`;
+  return c.json({ owner: { id: owner.id, email: owner.email, name: owner.name,
+                           terms_version: TERMS_VERSION,
+                           /* Sections for the screen to lay out, flat text as
+                              the fallback and as what the record will hold. An
+                              older app that knows nothing of sections still
+                              renders the whole policy rather than nothing. */
+                           terms_sections: TERMS_SECTIONS,
+                           terms_text: TERMS_TEXT,
+                           terms_checkbox: TERMS_CHECKBOX,
+                           terms_summary: TERMS_SUMMARY,
+                           terms_accepted_at: agreed?.accepted_at ?? null },
                   shops: rows });
 });
+
+/* Recording the undertaking.
+ *
+ * The words shown are stored WITH the acceptance, not referenced. A year from
+ * now the wording will have moved on, and a record that points at wherever the
+ * current text happens to live would say nothing about what was agreed to on
+ * the day. The version alone is not enough either: it names the text without
+ * being it.
+ *
+ * Accepting twice is not an error. A shopkeeper who taps again, or opens the
+ * app on a second phone, has not done anything wrong, and the first
+ * acceptance — the one with the earlier timestamp — is the one that stands. */
+app.post("/v1/owner/terms", async (c) => {
+  const owner = await needOwner(c);
+  const b = parse(z.object({
+    version: z.string().max(40),
+    /* The tick itself. Required, and required to be true — there is no
+       accepting these terms without it, so a client that forgets to send it
+       gets a 400 rather than quietly recording an acceptance nobody made. */
+    confirmed: z.literal(true),
+  }), await c.req.json());
+  if (b.version !== TERMS_VERSION)
+    return fail(c, 409, "those terms have changed \u2014 reopen the app and read them again");
+
+  await sql`insert into owner_terms (owner_id, version, text, confirmed, confirm_text)
+            values (${owner.id}, ${TERMS_VERSION}, ${TERMS_TEXT}, true, ${TERMS_CHECKBOX})
+            on conflict (owner_id, version) do nothing`;
+  const [row] = await sql`
+    select accepted_at from owner_terms
+     where owner_id = ${owner.id} and version = ${TERMS_VERSION}`;
+  console.log(`[terms] ${owner.email} accepted ${TERMS_VERSION}`);
+  return c.json({ accepted_at: row.accepted_at, version: TERMS_VERSION });
+});
+
+/* Has this owner agreed to the wording in force? Posting is refused until they
+   have, which is what makes the undertaking worth recording rather than a
+   screen somebody taps past. */
+async function hasAgreed(ownerId) {
+  const [row] = await sql`
+    select 1 from owner_terms
+     where owner_id = ${ownerId} and version = ${TERMS_VERSION}`;
+  return Boolean(row);
+}
 
 const PostIn = z.object({
   kind: z.enum(["sale", "arrival", "hours", "notice"]),
@@ -1194,6 +1290,18 @@ app.post("/v1/owner/shops/:slug/posts", async (c) => {
   const owner = await needOwner(c);
   const shop = await needShop(c, owner);
   const body = parse(PostIn, await c.req.json());
+
+  if (!await hasAgreed(owner.id))
+    return fail(c, 403, "read and accept the posting terms before your first post");
+
+  /* The two categories that would have the app removed. Checked on the server
+     rather than in the screen, so the rule holds whatever is calling. */
+  const hit = forbidden(body.name, body.note);
+  if (hit) {
+    console.warn(`[forbidden] ${owner.email} tried to post "${hit.term}" (${hit.category})`);
+    return fail(c, 422, forbiddenMessage(hit));
+  }
+
   if (body.kind === "sale" && body.now_cents == null)
     return fail(c, 400, "a sale needs a price");
   /* Publishing something already over would alert every follower about a sale
@@ -1258,6 +1366,15 @@ app.patch("/v1/owner/shops/:slug/posts/:id", async (c) => {
     if (b[k] !== undefined) patch[k] = b[k];
   }
   if (b.ends_at !== undefined) patch.ends_at = b.ends_at ? new Date(b.ends_at) : null;
+
+  /* An edit is a second door into the same room. Checked against what the post
+     would BECOME, not against what was sent, so changing only the note cannot
+     slip something past a check that looked at the name alone. */
+  const hit = forbidden(patch.name ?? before.name, patch.note ?? before.note);
+  if (hit) {
+    console.warn(`[forbidden] ${owner.email} tried to edit in "${hit.term}" (${hit.category})`);
+    return fail(c, 422, forbiddenMessage(hit));
+  }
 
   /* A sale without a price is not a sale. */
   const nowCents = patch.now_cents !== undefined ? patch.now_cents : before.now_cents;
@@ -1397,6 +1514,10 @@ app.patch("/v1/owner/shops/:slug", async (c) => {
   if (b.aisles) {
     const want = [...new Set(b.aisles.map((x) => x.trim()).filter(Boolean))];
     if (!want.length) return fail(c, 400, "a shop needs at least one aisle");
+    /* Better here than one post at a time: an aisle that cannot exist has
+       nothing to post into, and no shopper ever sees it offered. */
+    const aisleHit = forbidden(...want);
+    if (aisleHit) return fail(c, 422, forbiddenMessage(aisleHit));
     await sql`delete from shop_aisles where shop_id = ${shop.id}`;
     await sql`insert into shop_aisles ${sql(
       want.map((aisle, position) => ({ shop_id: shop.id, aisle, position })))}`;
@@ -1547,6 +1668,13 @@ app.post("/v1/admin/shops", async (c) => {
   guard(c);
   const b = parse(ShopIn, await c.req.json());
 
+  /* The operator is held to the same rule as a shopkeeper. Not because they
+     would do it deliberately, but because an aisle typed at a counter while
+     talking to somebody is exactly where "Tobacco" gets entered without a
+     thought, and that aisle would then sit on the shop's page forever. */
+  const aisleHit = forbidden(b.name, ...(b.aisles || []));
+  if (aisleHit) return fail(c, 422, forbiddenMessage(aisleHit));
+
   /* A shop taken off the app keeps its row, so it keeps its name — and the
      name is derived from the shop's own name, so re-adding that shop failed
      with "already exists" and nothing in the app could bring it back. The
@@ -1651,6 +1779,188 @@ app.post("/v1/admin/invites", async (c) => {
       ? "they have been emailed a link to their shop"
       : "mail is not sending — pass them this link yourself",
   }, 201);
+});
+
+/* ======================================================================== *
+ * REPORTING, BLOCKING, AND THE OPERATOR'S VIEW
+ *
+ * An app that carries what other people write needs four things, and they
+ * stand or fall together: something that refuses the obvious, a way for a
+ * person to tell us about what got through, a way to stop whoever did it, and
+ * an address they can write to. Three of those were missing.
+ *
+ * None of this is sophisticated. It does not need to be. It needs to exist,
+ * to be reachable in two taps from the thing being complained about, and to
+ * put the complaint somewhere a human actually looks.
+ * ======================================================================== */
+
+/* Published on the site already, and now in the app beside the report control:
+   Apple asks a user-content app to carry a way of reaching a human, and a page
+   somebody has to go looking for is not one. */
+const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || "hello@dealtitude.com";
+
+const ReportIn = z.object({
+  kind: z.enum(["post", "want", "shop"]),
+  slug: z.string().max(60),
+  /* Whichever identifies the thing: a post has an id, an ask has its text. */
+  post_id: z.string().uuid().optional(),
+  label: z.string().max(200).optional(),
+  reason: z.enum(["prohibited", "wrong", "offensive", "spam", "other"]).optional(),
+  note: z.string().max(500).optional(),
+});
+
+/* Anybody can report: a shopper on their phone, a shopkeeper looking at an ask
+ * on their metrics screen. Deliberately NOT restricted to one or the other —
+ * the person best placed to notice is whoever happens to be looking. */
+app.post("/v1/reports", async (c) => {
+  const b = parse(ReportIn, await c.req.json());
+  const device = await deviceFrom(c);
+  const owner = await ownerFrom(c);
+  if (!device && !owner) return fail(c, 401, "open the app and try again");
+  /* A blocked device reporting things is the usual next move after being
+     blocked. Accept it and drop it on the floor rather than arguing: it keeps
+     the app's behaviour identical either way, which gives away nothing. */
+  const fromBlocked = Boolean(device?.blocked_at);
+
+  const [shop] = await sql`select id, name from shops where slug = ${b.slug}`;
+  if (!shop) return fail(c, 404, "no such shop");
+
+  /* WHAT IT SAID, copied now. The whole point of a report is that the thing
+     reported is about to be removed, and a row pointing at a deleted post
+     tells a future reader nothing about what the fuss was. */
+  let text = b.label || "";
+  let normed = null;
+  if (b.kind === "post" && b.post_id) {
+    const [post] = await sql`
+      select name, coalesce(note, '') as note from posts where id = ${b.post_id}`;
+    text = post ? [post.name, post.note].filter(Boolean).join(" \u2014 ") : "(post is gone)";
+  } else if (b.kind === "want" && b.label) {
+    const [{ norm }] = await sql`select norm_item(${b.label}) as norm`;
+    normed = norm;
+  } else if (b.kind === "shop") {
+    text = shop.name;
+  }
+  if (!text) return fail(c, 400, "say what you're reporting");
+
+  if (!fromBlocked) {
+    await sql`
+      insert into reports (kind, shop_id, subject_id, subject_norm, subject_text,
+                           reason, note, by_device, by_owner)
+      values (${b.kind}, ${shop.id}, ${b.post_id ?? null}, ${normed},
+              ${text.slice(0, 500)}, ${b.reason ?? null}, ${b.note ?? null},
+              ${device?.id ?? null}, ${owner?.id ?? null})`;
+    console.warn(`[report] ${b.kind} at ${b.slug}: ${String(text).slice(0, 80)}`);
+  }
+
+  /* The same answer either way, and it promises only what is true: somebody
+     will look. Not "within 24 hours" — that is a promise one person operating
+     a pilot cannot keep, and an unkept one is worse than none. */
+  return c.json({ received: true,
+                  said: "Thanks \u2014 this has gone to Dealtitude and a person will look at it.",
+                  contact: SUPPORT_EMAIL }, 201);
+});
+
+/* --------------------------------------------------------- the operator --- */
+
+/* Everything open, newest first, with enough beside it to act without going
+   looking: what was said, which shop, and how old that shop is. */
+app.get("/v1/admin/reports", async (c) => {
+  guard(c);
+  const rows = await sql`
+    select r.id, r.kind, r.subject_id, r.subject_norm, r.subject_text, r.reason,
+           r.note, r.created_at, r.resolved_at, r.action,
+           s.slug, s.name as shop_name,
+           (select count(*) from reports r2
+             where r2.by_device = r.by_device and r.by_device is not null) as by_same,
+           d.blocked_at as reporter_blocked
+      from reports r
+      left join shops s on s.id = r.shop_id
+      left join devices d on d.id = r.by_device
+     order by r.resolved_at nulls first, r.created_at desc
+     limit 200`;
+  return c.json({ reports: rows });
+});
+
+/* Acting on one. Four verbs, because there are four things worth doing and a
+   free-text field would mean nothing is ever done consistently. */
+const ActIn = z.object({
+  action: z.enum(["hide", "block", "remove_shop", "none"]),
+  why: z.string().max(200).optional(),
+});
+
+app.post("/v1/admin/reports/:id/act", async (c) => {
+  guard(c);
+  const b = parse(ActIn, await c.req.json());
+  const [r] = await sql`select * from reports where id = ${c.req.param("id")}`;
+  if (!r) return fail(c, 404, "no such report");
+
+  let did = b.action;
+  if (b.action === "hide") {
+    if (r.kind === "post" && r.subject_id) {
+      /* Expired rather than deleted: the shop's own history stays honest, and
+         a shopper who already has the alert sees it greyed out rather than
+         watching it vanish. */
+      await sql`update posts set status = 'expired', ends_at = now()
+                 where id = ${r.subject_id}`;
+    } else if (r.kind === "want" && r.subject_norm) {
+      await sql`update wants set hidden_at = now()
+                 where shop_id = ${r.shop_id} and norm = ${r.subject_norm}`;
+    } else did = "none";
+  } else if (b.action === "block") {
+    /* Block the device that WROTE the thing, which for an ask is findable and
+       for a post is not — a post comes from a shop, and the answer to a bad
+       shop is remove_shop, not a block. */
+    if (r.kind === "want" && r.subject_norm) {
+      await sql`update devices set blocked_at = now(), blocked_why = ${b.why ?? "reported"}
+                 where id in (select device_id from wants
+                               where shop_id = ${r.shop_id} and norm = ${r.subject_norm})`;
+      await sql`update wants set hidden_at = now()
+                 where shop_id = ${r.shop_id} and norm = ${r.subject_norm}`;
+    } else did = "none";
+  } else if (b.action === "remove_shop") {
+    await sql`update shops set active = false where id = ${r.shop_id}`;
+  }
+
+  await sql`update reports set resolved_at = now(), action = ${did}
+             where id = ${r.id}`;
+  return c.json({ ok: true, action: did });
+});
+
+/* What has been posted lately, across every shop.
+ *
+ * The thing this exists for: a shop's FIRST posts. A shopkeeper who is going
+ * to post something they shouldn't does it early, before they have learnt what
+ * the app is for, and a pilot operator who finds out a fortnight later has a
+ * fortnight of it sitting on people's phones. `new_shop` marks anything from a
+ * shop younger than a fortnight so the eye goes to it first. */
+const NEW_SHOP_DAYS = 14;
+
+app.get("/v1/admin/feed", async (c) => {
+  guard(c);
+  const rows = await sql`
+    select p.id, p.kind, p.name, coalesce(p.note, '') as note, p.status,
+           p.created_at, s.slug, s.name as shop_name, s.created_at as shop_since,
+           (s.created_at > now() - make_interval(days => ${NEW_SHOP_DAYS})) as new_shop,
+           (select count(*) from reports r where r.subject_id = p.id) as reports
+      from posts p join shops s on s.id = p.shop_id
+     order by p.created_at desc
+     limit 100`;
+  return c.json({ posts: rows, new_shop_days: NEW_SHOP_DAYS });
+});
+
+/* Blocking without a report in hand, and letting one back in. Both exist
+   because the first block made in anger is the one that needs undoing. */
+app.post("/v1/admin/devices/:id/block", async (c) => {
+  guard(c);
+  const b = parse(z.object({ blocked: z.boolean(), why: z.string().max(200).optional() }),
+                  await c.req.json());
+  const [d] = await sql`
+    update devices set blocked_at = ${b.blocked ? sql`now()` : null},
+                       blocked_why = ${b.blocked ? (b.why ?? "operator") : null}
+     where id = ${c.req.param("id")}
+    returning id, blocked_at`;
+  if (!d) return fail(c, 404, "no such device");
+  return c.json({ id: d.id, blocked: Boolean(d.blocked_at) });
 });
 
 /* Place any shop that has no coordinates yet.
