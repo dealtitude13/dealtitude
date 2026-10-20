@@ -19,7 +19,7 @@ import {
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-19b";
+const BUILD = "2026-10-19c";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -616,7 +616,7 @@ app.get("/v1/shops", async (c) => {
     select ${shopShape}, s.lat, s.lon,
            coalesce((select array_agg(a.aisle order by a.position, a.aisle)
                        from shop_aisles a where a.shop_id = s.id), '{}') as aisles,
-           (select count(*) from follows f where f.shop_id = s.id) as followers
+           followers_for(s.id) as followers
       from shops s where s.active`;
 
   const near = [];
@@ -650,7 +650,7 @@ app.get("/v1/shops", async (c) => {
       select ${shopShape}, s.lat, s.lon,
              coalesce((select array_agg(a.aisle order by a.position, a.aisle)
                          from shop_aisles a where a.shop_id = s.id), '{}') as aisles,
-             (select count(*) from follows f2 where f2.shop_id = s.id) as followers
+             followers_for(s.id) as followers
         from follows f join shops s on s.id = f.shop_id
        where f.device_id = ${device.id} and s.active`;
     followedOutside = followed
@@ -674,7 +674,7 @@ app.get("/v1/shops/:slug", async (c) => {
     select ${shopShape},
            coalesce((select array_agg(a.aisle order by a.position, a.aisle)
                        from shop_aisles a where a.shop_id = s.id), '{}') as aisles,
-           (select count(*) from follows f where f.shop_id = s.id) as followers
+           followers_for(s.id) as followers
       from shops s where s.slug = ${c.req.param("slug")} and s.active`;
   if (!s) return fail(c, 404, "no such shop");
 

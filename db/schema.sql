@@ -697,3 +697,214 @@ create table if not exists shop_hours (
 -- whatever prose it already had.
 comment on column shops.hours is
   'Display summary. Built from shop_hours when rows exist; free text otherwise.';
+
+-- ------------------------------------------------------ counting a follower
+-- The follower count was `count(*) from follows`, which counts rows rather
+-- than people — and a row is created by every fresh install.
+--
+-- Reinstalling the app is indistinguishable from buying a new phone. The
+-- device token is the identity, a reinstall has no token yet, and the push
+-- endpoint that would otherwise recognise the phone does not exist until
+-- somebody grants notification permission — and is reissued by Apple on
+-- reinstall anyway. So each install left its predecessor behind, still
+-- following, and the shop's number climbed. Five test installs read as five
+-- followers. That is the one number a shop is being asked to believe.
+--
+-- There is no honest way to link two installs back to one person: that is the
+-- cost of having no accounts, and it is a cost worth paying. What can be fixed
+-- is the counting, so a follow counts when its device is either
+--
+--   reachable  — it exists, is not retired, and has somewhere to send to; or
+--   in use     — it has been seen recently, which is what an opted-out but
+--                active shopper looks like.
+--
+-- An abandoned install is neither, so it stops counting. A real follower who
+-- declined notifications keeps counting while they keep opening the app, and
+-- one who allowed them keeps counting even if they never open it again.
+create or replace function followers_for(p_shop_id uuid)
+returns bigint
+language sql stable as $$
+  select count(*)
+    from follows f
+    join devices d on d.id = f.device_id
+   where f.shop_id = p_shop_id
+     and d.retired_at is null
+     and (d.endpoint is not null
+          or d.last_seen_at > now() - interval '30 days')
+$$;
+
+-- reach_for's four numbers have to come from the same set, or `total` and
+-- `muted + no_push + reachable` stop agreeing and the owner's panel contradicts
+-- its own subtotals.
+create or replace function reach_for(p_shop_id uuid)
+returns table (total bigint, muted bigint, no_push bigint, reachable bigint)
+language sql stable as $$
+  with s as (select min_age from shops where id = p_shop_id),
+  ok as (
+    select f.muted,
+           d.id is not null and d.retired_at is null and d.endpoint is not null
+             as has_push,
+           (select min_age from s) is null
+             or (d.age_ok_to is not null
+                 and d.age_ok_to >= (select min_age from s))  as old_enough
+      from follows f
+      join devices d on d.id = f.device_id
+     where f.shop_id = p_shop_id
+       and d.retired_at is null
+       and (d.endpoint is not null
+            or d.last_seen_at > now() - interval '30 days')
+  )
+  select count(*)                                                   as total,
+         count(*) filter (where muted)                              as muted,
+         count(*) filter (where not muted
+                            and (not has_push or not old_enough))   as no_push,
+         count(*) filter (where not muted and has_push
+                            and old_enough)                         as reachable
+    from ok
+$$;
+
+-- recipients_for has to draw from the same set as followers_for, or the
+-- owner's publish card contradicts their own shop page: "5 followers, 0 sent,
+-- 4 of them have no device". An abandoned install is not a follower who could
+-- not be reached, it is not a follower — so it gets no decision and no ledger
+-- row, rather than one more "no_device" on every post forever.
+--
+-- A real shopper who declined notifications is NOT filtered out here: their
+-- device has been seen recently, so it passes, and it still earns an honest
+-- 'no_device' because there is genuinely nowhere to send. That distinction is
+-- the whole point of the condition being reachable OR recently seen.
+create or replace function recipients_for(p_post_id uuid)
+returns table (device_id uuid, withheld text)
+language sql stable as $$
+  with p as (
+    select po.*, s.daily_cap, s.min_age
+      from posts po join shops s on s.id = po.shop_id
+     where po.id = p_post_id
+  )
+  select f.device_id,
+         case
+           when f.muted then 'muted'
+           when p.min_age is not null
+                and (d.age_ok_to is null or d.age_ok_to < p.min_age)
+             then 'age_unverified'
+           when d.id is null or d.retired_at is not null or d.endpoint is null
+             then 'no_device'
+           when p.kind in ('sale','arrival')
+                and not (p.aisle = any (f.aisles))
+                and not exists (
+                  select 1 from wants w
+                   where w.shop_id   = p.shop_id
+                     and w.device_id = f.device_id
+                     and w.alert
+                     and w.norm      = norm_item(p.name))
+             then 'aisle_off'
+           when (select count(*) from deliveries dl
+                  where dl.device_id = f.device_id
+                    and dl.shop_id   = p.shop_id
+                    and dl.withheld is null
+                    and dl.sent_at > now() - interval '24 hours') >= p.daily_cap
+             then 'daily_cap'
+           else null
+         end as withheld
+    from p
+    join follows f on f.shop_id = p.shop_id
+    left join devices d on d.id = f.device_id and d.retired_at is null
+   where exists (
+     select 1 from devices dd
+      where dd.id = f.device_id
+        and dd.retired_at is null
+        and (dd.endpoint is not null
+             or dd.last_seen_at > now() - interval '30 days'))
+$$;
+
+-- Correction to the three functions above: "reachable OR in use", where
+-- retired counts as unreachable rather than as not-a-follower.
+--
+-- The first attempt excluded any retired device outright, which broke a
+-- promise this schema makes in several places: a phone that cannot be reached
+-- is still a real follower, and the owner's panel is supposed to show them as
+-- unreachable rather than hide them. Apple retires a token when someone turns
+-- notifications off in iOS Settings as well as when they delete the app — the
+-- first of those is a customer who still has the shop on their phone and still
+-- opens it.
+--
+-- So a device drops out only when it is BOTH unreachable AND has not been seen
+-- for 30 days. That is an abandoned install, and nothing else is.
+create or replace function followers_for(p_shop_id uuid)
+returns bigint
+language sql stable as $$
+  select count(*)
+    from follows f
+    join devices d on d.id = f.device_id
+   where f.shop_id = p_shop_id
+     and ((d.retired_at is null and d.endpoint is not null)     -- reachable
+          or d.last_seen_at > now() - interval '30 days')       -- or in use
+$$;
+
+create or replace function reach_for(p_shop_id uuid)
+returns table (total bigint, muted bigint, no_push bigint, reachable bigint)
+language sql stable as $$
+  with s as (select min_age from shops where id = p_shop_id),
+  ok as (
+    select f.muted,
+           d.retired_at is null and d.endpoint is not null as has_push,
+           (select min_age from s) is null
+             or (d.age_ok_to is not null
+                 and d.age_ok_to >= (select min_age from s))  as old_enough
+      from follows f
+      join devices d on d.id = f.device_id
+     where f.shop_id = p_shop_id
+       and ((d.retired_at is null and d.endpoint is not null)
+            or d.last_seen_at > now() - interval '30 days')
+  )
+  select count(*)                                                   as total,
+         count(*) filter (where muted)                              as muted,
+         count(*) filter (where not muted
+                            and (not has_push or not old_enough))   as no_push,
+         count(*) filter (where not muted and has_push
+                            and old_enough)                         as reachable
+    from ok
+$$;
+
+create or replace function recipients_for(p_post_id uuid)
+returns table (device_id uuid, withheld text)
+language sql stable as $$
+  with p as (
+    select po.*, s.daily_cap, s.min_age
+      from posts po join shops s on s.id = po.shop_id
+     where po.id = p_post_id
+  )
+  select f.device_id,
+         case
+           when f.muted then 'muted'
+           when p.min_age is not null
+                and (d.age_ok_to is null or d.age_ok_to < p.min_age)
+             then 'age_unverified'
+           when d.id is null or d.retired_at is not null or d.endpoint is null
+             then 'no_device'
+           when p.kind in ('sale','arrival')
+                and not (p.aisle = any (f.aisles))
+                and not exists (
+                  select 1 from wants w
+                   where w.shop_id   = p.shop_id
+                     and w.device_id = f.device_id
+                     and w.alert
+                     and w.norm      = norm_item(p.name))
+             then 'aisle_off'
+           when (select count(*) from deliveries dl
+                  where dl.device_id = f.device_id
+                    and dl.shop_id   = p.shop_id
+                    and dl.withheld is null
+                    and dl.sent_at > now() - interval '24 hours') >= p.daily_cap
+             then 'daily_cap'
+           else null
+         end as withheld
+    from p
+    join follows f on f.shop_id = p.shop_id
+    left join devices d on d.id = f.device_id and d.retired_at is null
+   where exists (
+     select 1 from devices dd
+      where dd.id = f.device_id
+        and ((dd.retired_at is null and dd.endpoint is not null)
+             or dd.last_seen_at > now() - interval '30 days'))
+$$;
