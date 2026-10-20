@@ -19,7 +19,7 @@ import {
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-20b";
+const BUILD = "2026-10-20d";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -1287,6 +1287,10 @@ app.get("/v1/owner/shops/:slug/reach", async (c) => {
   const owner = await needOwner(c);
   const shop = await needShop(c, owner);
   const [reach] = await sql`select * from reach_for(${shop.id})`;
+  /* How many of those reachable followers we have EVIDENCE for, as opposed to
+     a push token on file that nothing has tested yet. */
+  const [{ confirmed_for: confirmed }] =
+    await sql`select confirmed_for(${shop.id})`;
   const [week] = await sql`
     select count(*) as new_this_week from follows
      where shop_id = ${shop.id} and created_at > now() - interval '7 days'`;
@@ -1294,7 +1298,7 @@ app.get("/v1/owner/shops/:slug/reach", async (c) => {
     select a.aisle, count(*) filter (where a.aisle = any (f.aisles)) as wanted
       from shop_aisles a left join follows f on f.shop_id = a.shop_id
      where a.shop_id = ${shop.id} group by a.aisle order by wanted desc`;
-  return c.json({ ...reach, ...week, aisles });
+  return c.json({ ...reach, confirmed: Number(confirmed), ...week, aisles });
 });
 
 /* Real demand, most-wanted first. The panel this feeds used to read the

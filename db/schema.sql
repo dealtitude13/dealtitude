@@ -908,3 +908,50 @@ language sql stable as $$
         and ((dd.retired_at is null and dd.endpoint is not null)
              or dd.last_seen_at > now() - interval '30 days'))
 $$;
+
+-- -------------------------------------------- reachable, and CONFIRMED reachable
+-- A follower who uninstalls keeps a push token that still looks valid. Nothing
+-- contradicts it until the shop posts again and Apple answers "Unregistered",
+-- so between the uninstall and the next post a shop is told it can reach
+-- somebody it cannot.
+--
+-- That overstates the one number a shop is asked to believe. The honest answer
+-- is not to guess, but to separate what is KNOWN from what is merely on file.
+-- A device is confirmed when there is evidence the app is still on that phone:
+--
+--   a successful delivery in the last 30 days — any shop's, because what is
+--     being proven is that the phone exists and that push reaches it; or
+--   the app itself having been opened in the last 30 days.
+--
+-- Everything else is simply not confirmed: new followers nobody has posted to
+-- yet, and people who have quietly gone. The screen says which is which.
+--
+-- Its own function rather than a sixth column on reach_for. That function has
+-- been redefined five times in this file as the rules grew, and every one of
+-- those definitions is still here — widening its return type would make each
+-- of them fail on the next run, and this file is applied on every boot.
+-- Additive, like everything else above it.
+create or replace function confirmed_for(p_shop_id uuid)
+returns bigint
+language sql stable as $$
+  with s as (select min_age from shops where id = p_shop_id)
+  select count(*)
+    from follows f
+    join devices d on d.id = f.device_id
+   where f.shop_id = p_shop_id
+     and not f.muted
+     /* Confirmed is a subset of reachable: there is no sense in which somebody
+        unreachable is confirmed reachable. These three conditions mirror
+        reach_for's "reachable" exactly. */
+     and d.retired_at is null
+     and d.endpoint is not null
+     and ((select min_age from s) is null
+          or (d.age_ok_to is not null
+              and d.age_ok_to >= (select min_age from s)))
+     /* And the evidence itself. */
+     and (d.last_seen_at > now() - interval '30 days'
+          or exists (select 1 from deliveries dl
+                      where dl.device_id = d.id
+                        and dl.withheld is null
+                        and dl.sent_at > now() - interval '30 days'))
+$$;
