@@ -19,7 +19,7 @@ import {
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-19a";
+const BUILD = "2026-10-19b";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -283,6 +283,12 @@ app.get("/v1/device/recovery", async (c) => {
   return c.json({
     email: d.recovery_email || null,
     verified: Boolean(d.recovery_verified_at),
+    /* Whether this server can send the confirmation at all. The app hides the
+       whole card when it cannot: offering to save an address, and then telling
+       someone it could not be confirmed, is a feature that does not work —
+       which is both a poor first impression and the kind of thing an App
+       Store reviewer rejects a build for. */
+    can_send: mailConfigured,
   });
 });
 
