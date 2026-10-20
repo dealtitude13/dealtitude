@@ -19,7 +19,7 @@ import {
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-20a";
+const BUILD = "2026-10-20b";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
