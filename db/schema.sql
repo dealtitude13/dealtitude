@@ -1036,3 +1036,17 @@ create table if not exists reports (
 );
 create index if not exists reports_open_idx on reports (created_at desc)
   where resolved_at is null;
+
+-- ------------------------------------------------- who a report is actually for
+-- Build 2026-10-22a. A report is not one thing. "The price is wrong" or "it
+-- wasn't there" is a customer talking to their grocer, and routing it through
+-- the operator makes a middleman of him in a conversation he is not part of.
+-- "Tobacco, lottery, offensive, spam" is the operator's, because acting on it
+-- means taking a post down or removing a shop, which no shopkeeper can do to
+-- themselves.
+--
+-- Decided on the server from the reason, never sent by the client: a reporter
+-- choosing who reads their report is a reporter choosing to be ignored.
+alter table reports add column if not exists audience text not null default 'operator';
+create index if not exists reports_shop_open_idx on reports (shop_id, created_at desc)
+  where resolved_at is null and audience = 'shop';

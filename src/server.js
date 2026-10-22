@@ -22,7 +22,7 @@ import {
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-20g";
+const BUILD = "2026-10-22a";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -1415,7 +1415,23 @@ app.get("/v1/owner/shops/:slug/reach", async (c) => {
     select a.aisle, count(*) filter (where a.aisle = any (f.aisles)) as wanted
       from shop_aisles a left join follows f on f.shop_id = a.shop_id
      where a.shop_id = ${shop.id} group by a.aisle order by wanted desc`;
-  return c.json({ ...reach, confirmed: Number(confirmed), ...week, aisles });
+  /* What this shop has actually sent today.
+   *
+   * The owner's screen used to work this out from a piece of the SHOPPER app's
+   * own state that only the demo walkthrough ever fills, so a live shop read
+   * "0 alerts sent today" for ever, printed next to its daily cap. A number a
+   * shopkeeper checks every morning has to come from the deliveries table. */
+  /* Counted as POSTS that reached somebody today, not as individual
+     deliveries: it sits beside "cap 3/day", which is a cap on posts per
+     follower, and "50 alerts sent today" next to "cap 3/day" would read as a
+     contradiction to the one person it is written for. `withheld` marks the
+     rows that did NOT go, so they are excluded. */
+  const [today] = await sql`
+    select count(distinct post_id)::int as sent_today
+      from deliveries
+     where shop_id = ${shop.id} and withheld is null
+       and sent_at > date_trunc('day', now())`;
+  return c.json({ ...reach, confirmed: Number(confirmed), ...week, ...today, aisles });
 });
 
 /* Real demand, most-wanted first. The panel this feeds used to read the
@@ -1805,8 +1821,12 @@ const ReportIn = z.object({
   /* Whichever identifies the thing: a post has an id, an ask has its text. */
   post_id: z.string().uuid().optional(),
   label: z.string().max(200).optional(),
-  reason: z.enum(["prohibited", "wrong", "offensive", "spam", "other"]).optional(),
-  note: z.string().max(500).optional(),
+  /* nullish, not optional. A client with nothing to say in the note field
+     naturally sends null, and `.optional()` alone rejects that with a 400 —
+     losing a report rather than storing one with an empty note. Somebody
+     whose report bounced does not file it again. */
+  reason: z.enum(["prohibited", "wrong", "offensive", "spam", "other"]).nullish(),
+  note: z.string().max(500).nullish(),
 });
 
 /* Anybody can report: a shopper on their phone, a shopkeeper looking at an ask
@@ -1842,14 +1862,35 @@ app.post("/v1/reports", async (c) => {
   }
   if (!text) return fail(c, 400, "say what you're reporting");
 
+  /* WHO IT IS FOR, decided here rather than by whoever is reporting.
+   *
+   * A wrong price, or an item that was not on the shelf, is a customer talking
+   * to their grocer. It belongs on the shop's own screen, where somebody can
+   * walk over and look. Sending it to the operator instead puts a stranger in
+   * the middle of a conversation about a shelf he has never seen, and the
+   * shopkeeper hears about it a day later if at all.
+   *
+   * The rest — the prohibited categories, abuse, spam — is the operator's,
+   * because the fix is taking a post down or removing a shop, and no shop can
+   * be trusted to do either to itself. */
+  const audience = b.reason === "wrong" ? "shop" : "operator";
+
   if (!fromBlocked) {
     await sql`
       insert into reports (kind, shop_id, subject_id, subject_norm, subject_text,
-                           reason, note, by_device, by_owner)
+                           reason, note, by_device, by_owner, audience)
       values (${b.kind}, ${shop.id}, ${b.post_id ?? null}, ${normed},
               ${text.slice(0, 500)}, ${b.reason ?? null}, ${b.note ?? null},
-              ${device?.id ?? null}, ${owner?.id ?? null})`;
-    console.warn(`[report] ${b.kind} at ${b.slug}: ${String(text).slice(0, 80)}`);
+              ${device?.id ?? null}, ${owner?.id ?? null}, ${audience})`;
+    console.warn(`[report:${audience}] ${b.kind} at ${b.slug}: ${String(text).slice(0, 80)}`);
+  }
+
+  /* What the reporter is told differs too, because it is a different promise:
+     one reaches the shop, the other reaches us. */
+  if (audience === "shop") {
+    return c.json({ received: true,
+      said: `Thanks \u2014 this has gone straight to ${shop.name}, who can check the shelf.`,
+      contact: SUPPORT_EMAIL }, 201);
   }
 
   /* The same answer either way, and it promises only what is true: somebody
@@ -1858,6 +1899,34 @@ app.post("/v1/reports", async (c) => {
   return c.json({ received: true,
                   said: "Thanks \u2014 this has gone to Dealtitude and a person will look at it.",
                   contact: SUPPORT_EMAIL }, 201);
+});
+
+/* What customers have told this shop directly. Not moderation: a price that
+   looks wrong, or something that was not on the shelf when somebody walked in
+   for it. The shopkeeper is the only person who can do anything about either. */
+app.get("/v1/owner/shops/:slug/feedback", async (c) => {
+  const owner = await needOwner(c);
+  const shop = await needShop(c, owner);
+  const rows = await sql`
+    select id, subject_text, note, created_at, resolved_at
+      from reports
+     where shop_id = ${shop.id} and audience = 'shop'
+     order by resolved_at nulls first, created_at desc
+     limit 50`;
+  return c.json({ feedback: rows });
+});
+
+/* Marking one as dealt with. The shopkeeper's own screen, so no operator key:
+   holding the shop is the permission. */
+app.post("/v1/owner/shops/:slug/feedback/:id/done", async (c) => {
+  const owner = await needOwner(c);
+  const shop = await needShop(c, owner);
+  const [row] = await sql`
+    update reports set resolved_at = now(), action = 'shop_saw_it'
+     where id = ${c.req.param("id")} and shop_id = ${shop.id} and audience = 'shop'
+    returning id`;
+  if (!row) return fail(c, 404, "no such message");
+  return c.json({ ok: true });
 });
 
 /* --------------------------------------------------------- the operator --- */
@@ -1876,6 +1945,7 @@ app.get("/v1/admin/reports", async (c) => {
       from reports r
       left join shops s on s.id = r.shop_id
       left join devices d on d.id = r.by_device
+     where r.audience = 'operator'
      order by r.resolved_at nulls first, r.created_at desc
      limit 200`;
   return c.json({ reports: rows });
