@@ -22,7 +22,7 @@ import {
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-22a";
+const BUILD = "2026-10-22c";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -580,7 +580,8 @@ const oldEnough = (device, shop) =>
 
 /* ----------------------------------------------------------------- shops -- */
 const shopShape = sql`
-  s.id, s.slug, s.name, s.address, s.town, s.zip, s.hours, s.daily_cap, s.min_age,
+  s.id, s.slug, s.name, s.address, s.town, s.state, s.zip, s.hours, s.daily_cap,
+  s.min_age,
   /* The week rides with every shop, not only with the one-shop page.
      It was on the page alone at first, which left the NEARBY LIST — the screen
      a shopper actually scans before deciding where to drive — still reading a
@@ -605,6 +606,147 @@ const shopShape = sql`
  *
  * radius is in miles, defaults to 5, and is capped so this cannot be turned
  * into "every shop in the country" by editing a URL. */
+/* ONE BOX, THREE KINDS OF ANSWER.
+ *
+ * Asking a shopper for a ZIP before they can see anything is the most
+ * restrictive opening a local app can have: people know the name of the shop
+ * they want, or the town they are in, far more reliably than they know a
+ * postcode. So the box takes whatever they type and this works out what it is.
+ *
+ * ZIP stays its own path because it is the only one that can answer "how far
+ * away", which is the question a shopper is really asking. Town and name
+ * searches cannot: there is no point to measure from, and a made-up distance
+ * is worse than none.
+ */
+const looksLikeZip = (q) => /^\d{5}$/.test(q);
+
+/* "Austin, TX" and "Austin TX" both mean the same thing to a person. A
+   trailing two-letter word is a state if there is something before it. */
+function splitPlace(q) {
+  /* A state comes back in CAPITALS whatever case it was typed in, because the
+     app says it back to the shopper — "nothing in Monroeville, nj" reads like
+     a typo of ours rather than an answer about their town. */
+  const st = (x) => x.trim().toUpperCase();
+  const comma = q.split(",");
+  if (comma.length === 2) {
+    const town = comma[0].trim(), state = comma[1].trim();
+    if (town && /^[A-Za-z]{2}$/.test(state)) return { town, state: st(state) };
+    if (town) return { town, state: null };
+  }
+  const words = q.trim().split(/\s+/);
+  if (words.length >= 2 && /^[A-Za-z]{2}$/.test(words[words.length - 1])) {
+    return { town: words.slice(0, -1).join(" "), state: st(words[words.length - 1]) };
+  }
+  return { town: q.trim(), state: null };
+}
+
+/* What somebody typed, made safe to put inside a LIKE pattern.
+ *
+ * `%` and `_` are wildcards to Postgres and ordinary characters to the person
+ * typing them, and the gap between those two facts is a bug: a search for
+ * "___" matched every shop with three or more characters in its name, which
+ * is every shop. It is not an injection — the value is still a bound
+ * parameter — but it is a search box that answers a question nobody asked.
+ * The backslash goes first, or escaping the others would re-escape it. */
+const likeSafe = (x) => x.toLowerCase()
+  .replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+
+app.get("/v1/shops/search", async (c) => {
+  const q = (c.req.query("q") || "").trim();
+  if (q.length < 2) return fail(c, 400, "type at least two characters");
+
+  /* A ZIP is answered by the route that knows about distance, so the caller
+     gets the same shape either way and the app has one list to render. */
+  if (looksLikeZip(q)) {
+    return c.redirect(`/v1/shops?zip=${q}` +
+      (c.req.query("radius") ? `&radius=${c.req.query("radius")}` : ""), 307);
+  }
+
+  const { town, state } = splitPlace(q);
+  const like = `%${likeSafe(town)}%`;
+
+  /* Name OR town, so one box serves "Galaxy" and "Monroe Township".
+   *
+   * A state, when given, is REQUIRED to match. The first version let shops
+   * with no state through on the reasoning that most shops predate the
+   * column — which meant "Monroe Township, TX" cheerfully returned New Jersey.
+   * Somebody who types a state is telling us something, and answering with
+   * another state's shops is worse than answering with nothing: they are
+   * standing in Texas deciding whether to drive somewhere.
+   *
+   * The cost is that a shop with no state on file cannot be found by a search
+   * that names one. It is still found by its town or its name, and the Admin
+   * form now asks for a state, so this corrects itself as shops are edited. */
+  const rows = await sql`
+    select ${shopShape}, s.lat, s.lon,
+           coalesce((select array_agg(a.aisle order by a.position, a.aisle)
+                       from shop_aisles a where a.shop_id = s.id), '{}') as aisles,
+           followers_for(s.id) as followers,
+           (lower(s.name) like ${like} escape '\\') as by_name
+      from shops s
+     where s.active
+       and (lower(s.name) like ${like} escape '\\'
+         or lower(s.town) like ${like} escape '\\')
+       and (${state === null} or lower(s.state) = ${state ? state.toLowerCase() : ""})
+     order by (lower(s.name) like ${like} escape '\\') desc, s.name
+     limit 50`;
+
+  return c.json({
+    shops: rows.map((r) => ({ ...r, miles: null })),
+    query: q,
+    /* What we decided they meant, so the app can say it back to them and a
+       wrong guess is visible rather than mysterious. */
+    read_as: { town, state },
+    zip: null, radius: null, followed_outside: [], unplaceable: 0,
+  });
+});
+
+/* ---------------------------------------------------------- the waitlist --- */
+/* Somebody searched and there was nothing. The only moment a shopper is ever
+ * asked for an email, and only because the honest alternative is telling them
+ * to keep checking back. */
+app.post("/v1/waitlist", async (c) => {
+  const b = parse(z.object({
+    query: z.string().trim().min(2).max(120),
+    email: z.string().trim().email(),
+  }), await c.req.json());
+
+  /* Attached to the phone when there is one, so a shop opening later can be
+     matched to a device that is still around. Never required: somebody who
+     has not registered a device yet is exactly who this is for. */
+  const device = await deviceFrom(c).catch(() => null);
+  const zip = looksLikeZip(b.query) ? b.query : null;
+
+  await sql`
+    insert into waitlist (query, zip, email, device_id)
+    values (${b.query}, ${zip}, ${b.email}, ${device?.id ?? null})
+    on conflict do nothing`;
+  console.log(`[waitlist] ${b.email} wants ${b.query}`);
+
+  /* The same answer whether or not they had already asked. Telling somebody
+     "you are already on this list" is of no use to them and says that we keep
+     a list they can be looked up in. */
+  return c.json({ ok: true,
+    said: "We'll email you as soon as a shop near there joins." }, 201);
+});
+
+/* What the operator sees: where people are asking for shops, busiest first.
+   This is the list that decides which town to open in next. */
+app.get("/v1/admin/waitlist", async (c) => {
+  guard(c);
+  const rows = await sql`
+    select coalesce(zip, lower(query)) as place,
+           max(query) as example,
+           count(*)::int as people,
+           max(created_at) as last_asked
+      from waitlist
+     where notified_at is null
+     group by coalesce(zip, lower(query))
+     order by count(*) desc, max(created_at) desc
+     limit 100`;
+  return c.json({ places: rows });
+});
+
 app.get("/v1/shops", async (c) => {
   const zip = (c.req.query("zip") || "").trim();
   if (!/^\d{5}$/.test(zip)) return fail(c, 400, "a 5-digit zip is required");
@@ -1458,6 +1600,9 @@ const ShopEdit = z.object({
   name:      z.string().min(2).max(80).optional(),
   address:   z.string().min(2).max(120).optional(),
   town:      z.string().min(2).max(60).optional(),
+  /* Upper-cased on the way in so "nj" and "NJ" are the same shop to a search. */
+  state:     z.string().trim().regex(/^[A-Za-z]{2}$/)
+               .transform((v) => v.toUpperCase()).nullable().optional(),
   zip:       z.string().regex(/^\d{5}$/).optional(),
   hours:     z.string().max(80).nullable().optional(),
   phone:     z.string().max(32).nullable().optional(),
@@ -1481,7 +1626,8 @@ app.patch("/v1/owner/shops/:slug", async (c) => {
   const b = parse(ShopEdit, await c.req.json());
 
   const patch = {};
-  for (const k of ["name", "address", "town", "zip", "hours", "phone", "note", "daily_cap"]) {
+  for (const k of ["name", "address", "town", "state", "zip", "hours", "phone",
+                   "note", "daily_cap"]) {
     if (b[k] !== undefined) patch[k] = b[k];
   }
 
@@ -1645,6 +1791,10 @@ const ShopIn = z.object({
   name: z.string().min(1).max(120),
   address: z.string().min(1).max(200),
   town: z.string().min(1).max(80),
+  /* Two letters, so "Austin, TX" can find this shop. Optional because the
+     column arrived after the first shops did, and a shop is perfectly usable
+     without one — it is simply not findable by a search that names a state. */
+  state: z.string().trim().regex(/^[A-Za-z]{2}$/).nullable().optional(),
   zip: z.string().regex(/^\d{5}$/),
   hours: z.string().max(80).optional(),
   daily_cap: z.number().int().min(1).max(10).default(3),
@@ -1710,6 +1860,7 @@ app.post("/v1/admin/shops", async (c) => {
   const at = zipPoint(b.zip);
   const fields = {
     name: b.name, address: b.address, town: b.town, zip: b.zip,
+    state: b.state ? b.state.toUpperCase() : null,
     hours: b.hours ?? null, daily_cap: b.daily_cap, min_age: b.min_age ?? null,
     lat: at?.lat ?? null, lon: at?.lon ?? null,
   };
@@ -1907,11 +2058,20 @@ app.post("/v1/reports", async (c) => {
 app.get("/v1/owner/shops/:slug/feedback", async (c) => {
   const owner = await needOwner(c);
   const shop = await needShop(c, owner);
+  /* OPEN ONES ONLY.
+   *
+   * This returned everything, resolved or not, and the screen drew all of it.
+   * So "Sorted" removed a message until the next load and then it was back,
+   * with the same button on it — which teaches a shopkeeper that the button
+   * does nothing and that the list cannot be trusted.
+   *
+   * The row itself is kept, resolved, for the record; it simply stops being
+   * something the shop is being asked to deal with. */
   const rows = await sql`
-    select id, subject_text, note, created_at, resolved_at
+    select id, subject_text, note, created_at
       from reports
-     where shop_id = ${shop.id} and audience = 'shop'
-     order by resolved_at nulls first, created_at desc
+     where shop_id = ${shop.id} and audience = 'shop' and resolved_at is null
+     order by created_at desc
      limit 50`;
   return c.json({ feedback: rows });
 });

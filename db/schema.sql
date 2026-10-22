@@ -1050,3 +1050,39 @@ create index if not exists reports_open_idx on reports (created_at desc)
 alter table reports add column if not exists audience text not null default 'operator';
 create index if not exists reports_shop_open_idx on reports (shop_id, created_at desc)
   where resolved_at is null and audience = 'shop';
+
+-- ------------------------------------------------- searching, and finding nothing
+-- Build 2026-10-22c.
+--
+-- A state, so "Austin, TX" can mean something. Nullable on purpose: every shop
+-- that existed before this column did has a town and a ZIP and nothing else,
+-- and inventing a state for it from a ZIP centroid would be a guess written
+-- into the record as a fact. New shops are asked for it; old ones match on
+-- their town and their name until somebody edits them.
+alter table shops add column if not exists state text;
+create index if not exists shops_town_idx on shops (lower(town));
+create index if not exists shops_name_idx on shops (lower(name));
+
+-- Somebody who looked for shops and found none.
+--
+-- This is the only place a shopper is ever asked for an email, and it is asked
+-- for one reason: there is nothing here for them yet, and the alternative is
+-- telling them to come back and check. `query` is what they actually typed, so
+-- a town that twenty people searched for is visible as a town worth opening in
+-- rather than as twenty unrelated rows.
+create table if not exists waitlist (
+  id          uuid primary key default gen_random_uuid(),
+  query       text not null,            -- what they typed, as typed
+  zip         text,                     -- when it was a ZIP, for grouping
+  email       text not null,
+  device_id   uuid references devices(id) on delete set null,
+  created_at  timestamptz not null default now(),
+  notified_at timestamptz
+);
+-- One row per person per thing they searched for. An expression cannot go in
+-- an inline unique constraint, so it is an index: asking twice updates nothing
+-- rather than filling the table with the same person.
+create unique index if not exists waitlist_once_idx
+  on waitlist (lower(query), lower(email));
+create index if not exists waitlist_open_idx on waitlist (created_at desc)
+  where notified_at is null;
