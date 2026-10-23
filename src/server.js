@@ -22,7 +22,7 @@ import {
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-22c";
+const BUILD = "2026-10-22d";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -2176,6 +2176,36 @@ app.get("/v1/admin/feed", async (c) => {
      order by p.created_at desc
      limit 100`;
   return c.json({ posts: rows, new_shop_days: NEW_SHOP_DAYS });
+});
+
+/* Every shop on the app, for the one person who runs it.
+ *
+ * The operator's "Collaborating shops" screen had no source of its own: it
+ * rendered whatever shops happened to be in the app's memory, which meant it
+ * was filled as a side effect of a ZIP search the operator had done as a
+ * shopper beforehand. Sign in fresh on a new phone and the screen that is
+ * supposed to list the whole pilot said "0 shops".
+ *
+ * It survived that long because the screen before the Shops tab always asked
+ * for a ZIP, so in practice a search had usually happened. Removing that
+ * screen in 22d took the accident away and left the gap visible.
+ *
+ * Owners are included because the next question after "which shops" is always
+ * "who has the keys", and the operator is the only person entitled to ask. */
+app.get("/v1/admin/shops", async (c) => {
+  guard(c);
+  const rows = await sql`
+    select ${shopShape}, s.lat, s.lon, s.active, s.created_at,
+           coalesce((select array_agg(a.aisle order by a.position, a.aisle)
+                       from shop_aisles a where a.shop_id = s.id), '{}') as aisles,
+           followers_for(s.id) as followers,
+           coalesce((select array_agg(o.email order by o.email)
+                       from memberships m join owners o on o.id = m.owner_id
+                      where m.shop_id = s.id), '{}') as owners
+      from shops s
+     order by s.active desc, s.created_at desc
+     limit 500`;
+  return c.json({ shops: rows.map((r) => ({ ...r, miles: null })) });
 });
 
 /* Blocking without a report in hand, and letting one back in. Both exist
