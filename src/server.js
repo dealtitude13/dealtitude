@@ -22,7 +22,7 @@ import {
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-22d";
+const BUILD = "2026-10-22e";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -74,6 +74,45 @@ app.use("*", async (c, next) => {
     return c.json({ error: "slow down" }, 429);
   await next();
 });
+
+/* ---- the throttle that protects other people's inboxes --------------------
+ *
+ * Two of the routes that send mail are open to anybody: the owner sign-in link
+ * and the recovery confirmation. Neither needs an account to call, and both
+ * take the destination address straight from the request body. That is
+ * harmless while there is no mail sender wired — the link goes to a log line —
+ * and it stops being harmless the moment a real key is set, because the route
+ * becomes a way to put mail in a stranger's inbox, from this domain, as fast
+ * as the limiter above allows.
+ *
+ * The damage would not land on them. It lands here: a provider suspends an
+ * account over abuse complaints, and a burned sending domain means the
+ * sign-in links real shopkeepers are waiting for stop arriving.
+ *
+ * Keyed on the ADDRESS, not the IP. The person being mailed is the one being
+ * harmed, and rotating IPs is the easiest thing in the world; the per-IP
+ * limiter above protects the server, this one protects people. Callers must
+ * answer exactly as they would have — a refusal that looks different is a way
+ * to ask this server which addresses are registered.
+ *
+ * Skipped when no mail sender is configured, because then nothing reaches
+ * anybody and the only cost is a line in a log. That is also what lets a
+ * pilot, and the test harness, sign in as often as they need to.
+ */
+const mailHits = new Map();
+function mailAllowed(email, perHour) {
+  if (!mailConfigured) return true;
+  const key = String(email || "").trim().toLowerCase();
+  const now = Date.now();
+  const rec = mailHits.get(key) || { n: 0, until: now + 3_600_000 };
+  if (now > rec.until) { rec.n = 0; rec.until = now + 3_600_000; }
+  rec.n++; mailHits.set(key, rec);
+  /* Bounded, like the per-IP map: an unbounded counter is its own denial of
+     service. Clearing wholesale forgives everyone, which is the safe way to
+     be wrong — the alternative silently locks real people out. */
+  if (mailHits.size > 5000) mailHits.clear();
+  return rec.n <= Number(perHour);
+}
 
 const fail = (c, status, error) => c.json({ error }, status);
 const parse = (schema, body) => {
@@ -321,7 +360,14 @@ app.post("/v1/device/recovery", async (c) => {
     try { return new URL(c.req.url).origin; } catch { return process.env.APP_URL || ""; }
   })();
   const link = `${origin}/v1/device/recovery/verify?t=${token}`;
-  const mail = await sendRecoveryConfirm(email, link);
+  /* Same reasoning as the sign-in route: anybody can register a device in one
+     request, so without this a loop could put a confirmation in any inbox as
+     often as it liked. The address has already been written to this device's
+     row above, which is this phone's own business; what is limited is how
+     often that turns into mail for somebody else. */
+  const mail = mailAllowed(email, process.env.RECOVERY_PER_HOUR || 6)
+    ? await sendRecoveryConfirm(email, link)
+    : { sent: false, reason: "throttled" };
 
   /* Same reasoning as the owner sign-in route: the link comes back in the body
      only on a server with no mail sender that is not production, so a pilot can
@@ -371,7 +417,7 @@ app.get("/v1/device/recovery/verify", async (c) => {
 
   if (!d) {
     return page("That link has expired",
-      "Open Dealtitude, go to the You tab and save your email again — a fresh " +
+      "Open Dealtitude, go to the Settings tab and save your email again — a fresh " +
       "link will arrive in a moment.");
   }
   return page("Your follows are protected",
@@ -379,27 +425,17 @@ app.get("/v1/device/recovery/verify", async (c) => {
     "shops you follow will come back. You can close this page.");
 });
 
-/**
- * The new phone. Unauthenticated by necessity, so it is careful.
- *
- * Always answers the same way whether or not the address is known. The code it
- * creates is the ordinary claim code: short-lived, single use, and worth only
- * the follows of the phone that address belongs to.
- */
-const restoreHits = new Map();
 app.post("/v1/device/restore", async (c) => {
   const b = parse(RecoveryIn, await c.req.json());
   const email = b.email.trim().toLowerCase();
 
   /* Per-address, not per-IP: the thing being protected is somebody's inbox,
      and a shared network should not stop a second person restoring. */
-  const now = Date.now();
-  const rec = restoreHits.get(email) || { n: 0, until: now + 3_600_000 };
-  if (now > rec.until) { rec.n = 0; rec.until = now + 3_600_000; }
-  rec.n++; restoreHits.set(email, rec);
-  if (restoreHits.size > 5000) restoreHits.clear();
-  /* Still a 200. A 429 here would confirm the address exists. */
-  if (rec.n > Number(process.env.RESTORE_PER_HOUR || 5)) return c.json({ ok: true });
+  /* Still a 200. A 429 here would confirm the address exists. Shares the one
+     throttle with the other two routes that mail somebody: this used to carry
+     its own copy of the same counter, and two implementations of one rule are
+     one rule waiting to drift. */
+  if (!mailAllowed(email, process.env.RESTORE_PER_HOUR || 5)) return c.json({ ok: true });
 
   /* The most recently used phone with that address. More than one is normal —
      someone who did this on an old phone and again on its replacement — and
@@ -424,7 +460,7 @@ app.post("/v1/device/restore", async (c) => {
      The code is sent in the clear beside the link on purpose. Someone who has
      already installed the app from the App Store would otherwise tap the link
      and land in Safari instead of in the app they are holding; typing ten
-     characters into the You tab gets them there with no deep-link setup. */
+     characters into the Settings tab gets them there with no deep-link setup. */
   await sendRestoreLink(email, `${process.env.APP_URL || ""}/#c=${code}`, code);
   return c.json({ ok: true });
 });
@@ -1075,7 +1111,7 @@ app.get("/v1/me/follows", async (c) => {
 });
 
 /* ------------------------------------------------- what reached this phone --
- * The Alerts tab used to be filled by the demo walkthrough and by nothing else
+ * Sent to You used to be filled by the demo walkthrough and by nothing else
  * — in the live app `setInbox` was never called, so it promised "anything a
  * shop you follow sends will appear here" and then showed an empty screen
  * forever.
@@ -1101,7 +1137,7 @@ app.get("/v1/me/alerts", async (c) => {
          This is the shopper's own record of what was sent to their phone, and
          taking a shop off the app is not a reason to erase it. The filter used
          to be here, which meant a shop being removed silently emptied the
-         Alerts tab of every alert it had ever sent — alerts kept arriving and
+         Sent to You tab of every alert it had ever sent — alerts kept arriving and
          the screen stayed blank for good, with nothing to explain it. The
          shop's name is still shown; only its listing is gone. */
       join shops s on s.id = d.shop_id
@@ -1158,11 +1194,23 @@ app.post("/v1/posts/:id/opened", async (c) => {
 /* ----------------------------------------------------------------- owner -- */
 app.post("/v1/auth/request", async (c) => {
   const { email } = parse(z.object({ email: z.string().email() }), await c.req.json());
-  const token = newToken();
-  await sql`insert into login_links (token, email, expires_at)
-            values (${store(token)}, ${email}, now() + interval '20 minutes')`;
-  const link = `${process.env.APP_URL || ""}/owner?token=${token}`;
-  const mail = await sendSignInLink(email, link, 20);
+
+  /* Checked BEFORE the row is written. A throttled request that still minted
+     a login link would leave valid tokens lying in the table for an address
+     whose owner never asked for any of them. */
+  const allowed = mailAllowed(email, process.env.SIGNIN_PER_HOUR || 6);
+
+  let mail = { sent: false, reason: "throttled" };
+  let link = "";
+  if (allowed) {
+    const token = newToken();
+    await sql`insert into login_links (token, email, expires_at)
+              values (${store(token)}, ${email}, now() + interval '20 minutes')`;
+    link = `${process.env.APP_URL || ""}/owner?token=${token}`;
+    mail = await sendSignInLink(email, link, 20);
+  } else {
+    console.warn(`[auth] throttled: too many sign-in links asked for ${email}`);
+  }
 
   /* The reply never says whether that address has a shop — telling a stranger
      which emails are registered hands them the list for free.

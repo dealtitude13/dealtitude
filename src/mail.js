@@ -282,8 +282,8 @@ function restoreBody(link, code) {
     "you picked — come back with it:",
     link,
     "",
-    `Already installed the Dealtitude app? Open it, go to the You tab, choose`,
-    `"I have a code" and type: ${code}`,
+    `Already installed the Dealtitude app? Open it, go to the Settings tab,`,
+    `choose "I have a code" and type: ${code}`,
     "",
     "This works once and expires in 2 hours.",
     "If you didn't ask for it, ignore it — nothing has changed.",
@@ -306,7 +306,7 @@ function restoreBody(link, code) {
     <div style="font-size:13px;line-height:1.55;color:#7A6E62;margin-top:22px;
       padding-top:16px;border-top:1px solid #F2ECE1">
       Already have the Dealtitude app installed? Open it, go to the
-      <b style="color:#1A1410">You</b> tab, choose "I have a code" and type:
+      <b style="color:#1A1410">Settings</b> tab, choose "I have a code" and type:
       <div style="font-family:ui-monospace,Menlo,monospace;font-size:20px;
         font-weight:600;letter-spacing:.12em;color:#1A1410;background:#F2ECE1;
         border-radius:9px;padding:12px;margin-top:10px;text-align:center">${code}</div>
