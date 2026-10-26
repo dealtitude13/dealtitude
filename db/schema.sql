@@ -1086,3 +1086,12 @@ create unique index if not exists waitlist_once_idx
   on waitlist (lower(query), lower(email));
 create index if not exists waitlist_open_idx on waitlist (created_at desc)
   where notified_at is null;
+
+-- ---------------------------------------------------------------------------
+-- When this phone last looked at what was sent to it.
+--
+-- The unread count needs a "you have seen these" mark, and `opened_at` on a
+-- delivery is not it: that is set when a NOTIFICATION is tapped, so an alert
+-- read inside the app would have counted as unread for ever. One timestamp per
+-- device, moved when the tab is opened.
+alter table devices add column if not exists alerts_seen_at timestamptz;

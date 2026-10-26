@@ -22,7 +22,7 @@ import {
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-22e";
+const BUILD = "2026-10-25a";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -1143,7 +1143,31 @@ app.get("/v1/me/alerts", async (c) => {
       join shops s on s.id = d.shop_id
      where d.device_id = ${device.id} and d.withheld is null
      order by d.sent_at desc limit 50`;
-  return c.json({ alerts: rows });
+  /* The number on the bell.
+   *
+   * Counted here rather than derived from the rows above, because the list is
+   * capped at 50 and an unread count that silently stops at 50 is a count
+   * nobody can trust. `seen_at` is when this phone last opened the tab;
+   * `opened_at` is when a notification was tapped. Either marks an alert as
+   * read, because both mean the person saw it. */
+  const [{ unread }] = await sql`
+    select count(*)::int as unread
+      from deliveries d
+     where d.device_id = ${device.id}
+       and d.withheld is null
+       and d.opened_at is null
+       and (${device.alerts_seen_at ?? null}::timestamptz is null
+            or d.sent_at > ${device.alerts_seen_at ?? null}::timestamptz)`;
+  return c.json({ alerts: rows, unread });
+});
+
+/* The phone says it has looked. Everything sent before this moment stops
+   counting, which is what makes the bell a reason to look rather than a
+   number that only ever grows. */
+app.post("/v1/me/alerts/seen", async (c) => {
+  const device = await need(c);
+  await sql`update devices set alerts_seen_at = now() where id = ${device.id}`;
+  return c.json({ ok: true, seen_at: new Date().toISOString() });
 });
 
 app.get("/v1/me/feed", async (c) => {
@@ -1953,6 +1977,9 @@ app.post("/v1/admin/invites", async (c) => {
   const b = parse(z.object({
     slug: z.string(), email: z.string().email(),
     role: z.enum(["owner", "staff"]).default("owner"),
+    /* "email" sends it; "link" skips the email and hands it back to be
+       texted. Defaults to sending, which is what it has always done. */
+    deliver: z.enum(["email", "link"]).default("email"),
   }), await c.req.json());
   /* The name as well as the id: it goes in the subject line of the first email
      this shopkeeper ever gets from us, and "undefined is ready on Dealtitude"
@@ -1981,18 +2008,32 @@ app.post("/v1/admin/invites", async (c) => {
             values (${store(linkToken)}, ${b.email},
                     now() + interval '7 days')`;
   const link = `${process.env.APP_URL || ""}/owner?token=${linkToken}`;
-  const mail = await sendInviteLink(b.email, link, shop.name, DAYS);
 
-  /* The caller already holds the operator key and chose this address a moment
-     ago, so handing the link back when mail did not go grants them nothing —
-     and it is the difference between a pilot that continues and one that waits
-     on DNS. Never included when the mail actually went. */
+  /* How it reaches them is the operator's call, because they are standing in
+     the shop and know which will work. `deliver: "link"` skips the email
+     entirely and hands the link back to be texted; anything else sends it.
+     Texting is often the better of the two: a new sending domain lands in a
+     spam folder for weeks, and a grocer who never finds the email concludes
+     the whole thing does not work. */
+  const bySelf = b.deliver === "link";
+  const mail = bySelf
+    ? { sent: false, reason: "operator_will_hand_it_over" }
+    : await sendInviteLink(b.email, link, shop.name, DAYS);
+
+  /* The link ALWAYS comes back now.
+     It used to be withheld whenever mail succeeded, on tidiness grounds — and
+     the day mail started working was the day the operator lost the ability to
+     hand a grocer their link while standing in front of them. The caller holds
+     the operator key and chose this address a second ago; they could mint
+     another link by inviting again. Withholding it protected nothing and cost
+     the one thing it is for. */
   return c.json({
-    invited: b.email, shop: b.slug, mail,
-    ...(mail.sent ? {} : { link }),
-    instructions: mail.sent
-      ? "they have been emailed a link to their shop"
-      : "mail is not sending — pass them this link yourself",
+    invited: b.email, shop: b.slug, mail, link,
+    instructions: bySelf
+      ? "pass them this link yourself"
+      : mail.sent
+      ? "they have been emailed a link to their shop — the link is here too"
+      : "mail did not send — pass them this link yourself",
   }, 201);
 });
 
@@ -2224,6 +2265,72 @@ app.get("/v1/admin/feed", async (c) => {
      order by p.created_at desc
      limit 100`;
   return c.json({ posts: rows, new_shop_days: NEW_SHOP_DAYS });
+});
+
+/* Correcting the address a shopkeeper signs in with.
+ *
+ * There was no way to do this at all. An owner's email IS their way in — it is
+ * what the sign-in link is sent to and the only thing that proves who they
+ * are — so a typo at signup, or a grocer who changes provider, locked them out
+ * of their own shop with no route back. The only workaround was inviting the
+ * new address, which left the old membership in place and two owners on a
+ * shop that has one.
+ *
+ * The operator does this rather than the owner. Letting somebody move their
+ * own login to a new address is a takeover waiting to happen if a session ever
+ * leaks; the operator already proves who the shopkeeper is by knowing them,
+ * which is the whole model this product runs on.
+ *
+ * Two cases, and the second is the one that bites: if the NEW address already
+ * has an owner row — they were invited to another shop under it, or signed in
+ * once years ago — renaming would collide with the unique index. So the
+ * memberships move across to that owner instead, and the old row goes.
+ */
+app.post("/v1/admin/owners/email", async (c) => {
+  guard(c);
+  const b = parse(z.object({
+    from: z.string().email(),
+    to: z.string().email(),
+  }), await c.req.json());
+  if (b.from.toLowerCase() === b.to.toLowerCase()) {
+    return fail(c, 400, "those are the same address");
+  }
+
+  const [old] = await sql`select * from owners where email = ${b.from}`;
+  if (!old) return fail(c, 404, "no owner with that address");
+
+  const [already] = await sql`select * from owners where email = ${b.to}`;
+  const moved = await sql.begin(async (tx) => {
+    if (!already) {
+      await tx`update owners set email = ${b.to} where id = ${old.id}`;
+      return { merged: false, shops: null };
+    }
+    /* Carry the shops across, skipping any the target already holds, then
+       retire the old row. Sessions hang off owner_id and are deleted with it,
+       which is correct: the point of changing the address is that the old one
+       should stop working. */
+    const rows = await tx`
+      insert into memberships (owner_id, shop_id, role)
+      select ${already.id}, m.shop_id, m.role
+        from memberships m where m.owner_id = ${old.id}
+      on conflict (owner_id, shop_id) do nothing
+      returning shop_id`;
+    await tx`delete from owners where id = ${old.id}`;
+    return { merged: true, shops: rows.length };
+  });
+
+  /* Any sign-in link already in flight to the old address is void — it would
+     sign them into an account that no longer exists, or worse, one that does. */
+  await sql`delete from login_links where email = ${b.from} and used_at is null`;
+  await sql`delete from invites where email = ${b.from} and accepted_at is null`;
+
+  const shops = await sql`
+    select s.slug, s.name from memberships m
+      join shops s on s.id = m.shop_id
+      join owners o on o.id = m.owner_id
+     where o.email = ${b.to} order by s.name`;
+  console.log(`[owner] ${b.from} -> ${b.to}${moved.merged ? " (merged)" : ""}`);
+  return c.json({ from: b.from, to: b.to, merged: moved.merged, shops });
 });
 
 /* Every shop on the app, for the one person who runs it.

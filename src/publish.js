@@ -162,7 +162,22 @@ export async function publish(shopId, input, postedBy = null) {
     /* A follow whose device vanished between the query and here. Rare, but it
        used to `continue` and so went into neither total. */
     if (!device) { note("no_device"); continue; }
-    const res = await send(device, payload);
+
+    /* The badge is this phone's number, not this post's.
+     *
+     * Apple shows whatever integer arrived last, so every alert has to carry
+     * the recipient's whole unread count or the icon ends up showing "1"
+     * for ever. Counted as the bell counts it — unopened, unseen — plus the
+     * one about to be delivered, which is not in `deliveries` yet. */
+    const [{ unread }] = await sql`
+      select count(*)::int as unread
+        from deliveries d
+       where d.device_id = ${r.device_id}
+         and d.withheld is null
+         and d.opened_at is null
+         and (${device.alerts_seen_at ?? null}::timestamptz is null
+              or d.sent_at > ${device.alerts_seen_at ?? null}::timestamptz)`;
+    const res = await send(device, { ...payload, badge: unread + 1 });
     if (res.ok) {
       sent++;
       if (askedBy.has(r.device_id)) reachedAskers++;

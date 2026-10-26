@@ -174,6 +174,13 @@ function attempt(device, payload, env) {
       aps: {
         alert: { title: payload.title, body: payload.body || "" },
         sound: "default",
+        /* The number on the app icon. Sent as an absolute count rather than
+           an increment, because Apple has no increment: whatever arrives last
+           is what the home screen shows. The server therefore has to know how
+           many unread this phone has, which is why `badge` is computed per
+           recipient rather than per post. Omitted entirely when unknown, since
+           sending 0 would clear a badge that other alerts had earned. */
+        badge: Number.isInteger(payload.badge) ? payload.badge : undefined,
         "thread-id": payload.shop || undefined,
       },
       shop: payload.shop || null,
