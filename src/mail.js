@@ -22,6 +22,37 @@ const REPLY_TO = process.env.MAIL_REPLY_TO || null;
 
 export const mailConfigured = Boolean(KEY);
 
+/* ------------------------------------------------------------- the footer --
+ * Who sent this, and from where.
+ *
+ * US commercial email has to carry a real postal address, and mail without one
+ * is also scored as spam — which is a large part of why these were landing in
+ * Junk rather than an inbox. One constant, used by all four emails, so the
+ * four can never drift apart or one of them quietly lose it.
+ *
+ * Settable from the environment so the address can be changed on the server
+ * without a deploy, which matters the day it changes.
+ */
+/* Deliberately empty by default. US commercial email is supposed to carry a
+   real postal address and mail without one scores worse with spam filters,
+   but which address that is belongs to whoever is running this — not to a
+   line checked into the source. Set MAIL_POSTAL_ADDRESS on the server and
+   every email picks it up at once, with no build and no deploy. Until then
+   the footer simply has no address line rather than an invented one. */
+const POSTAL = process.env.MAIL_POSTAL_ADDRESS || "";
+/* Same spelling the app and the server already use, so a shopkeeper who
+   replies and a shopkeeper who taps "contact" reach the same inbox. */
+const SUPPORT = process.env.SUPPORT_EMAIL || "hello@dealtitude.com";
+
+const footerText = () =>
+  `\n—\n${POSTAL ? POSTAL + "\n" : ""}${SUPPORT}`;
+const footerHtml = () => `
+    <div style="font-size:11.5px;line-height:1.5;color:#7A6E62;margin-top:18px;
+      padding-top:14px;border-top:1px solid #F2ECE1">
+      ${POSTAL ? POSTAL + "<br>" : ""}
+      <a href="mailto:${SUPPORT}" style="color:#7A6E62">${SUPPORT}</a>
+    </div>`;
+
 /* Plain text as well as HTML. Some shop owners read mail in clients that show
    one or the other, and a sign-in link that renders as nothing is a support
    call you cannot answer. */
@@ -33,7 +64,7 @@ function signInBody(link, minutes) {
     "",
     `It works once and expires in ${minutes} minutes.`,
     "If you didn't ask for it, you can ignore this — nothing has changed.",
-  ].join("\n");
+  ].join("\n") + footerText();
 
   const html = `<!doctype html><html><body style="margin:0;padding:24px;
   background:#F5EFE4;font-family:Helvetica,Arial,sans-serif;color:#1A1410">
@@ -56,6 +87,7 @@ function signInBody(link, minutes) {
       padding-top:16px;border-top:1px solid #F2ECE1">
       If you didn't ask for this, ignore it — nothing has changed.
     </div>
+  ${footerHtml()}
   </div></body></html>`;
 
   return { text, html };
@@ -121,7 +153,7 @@ function inviteBody(link, shopName, days) {
     "",
     `This link is yours alone and works for ${days} days.`,
     "If you weren't expecting this, you can ignore it — nothing has been shared.",
-  ].join("\n");
+  ].join("\n") + footerText();
 
   const html = `<!doctype html><html><body style="margin:0;padding:24px;
   background:#F5EFE4;font-family:Helvetica,Arial,sans-serif;color:#1A1410">
@@ -147,6 +179,7 @@ function inviteBody(link, shopName, days) {
       This link is yours alone and works for ${days} days. If you weren't
       expecting it, ignore it — nothing has been shared.
     </div>
+  ${footerHtml()}
   </div></body></html>`;
 
   return { text, html };
@@ -213,7 +246,7 @@ function recoveryBody(link) {
     "This is the only thing we use this address for. We won't send you deals,",
     "and no shop ever sees it.",
     "If you didn't ask for this, ignore it — nothing has been saved.",
-  ].join("\n");
+  ].join("\n") + footerText();
 
   const html = `<!doctype html><html><body style="margin:0;padding:24px;
   background:#F5EFE4;font-family:Helvetica,Arial,sans-serif;color:#1A1410">
@@ -239,6 +272,7 @@ function recoveryBody(link) {
       and no shop ever sees it. If you didn't ask for this, ignore it — nothing
       has been saved.
     </div>
+  ${footerHtml()}
   </div></body></html>`;
 
   return { text, html };
@@ -287,7 +321,7 @@ function restoreBody(link, code) {
     "",
     "This works once and expires in 2 hours.",
     "If you didn't ask for it, ignore it — nothing has changed.",
-  ].join("\n");
+  ].join("\n") + footerText();
 
   const html = `<!doctype html><html><body style="margin:0;padding:24px;
   background:#F5EFE4;font-family:Helvetica,Arial,sans-serif;color:#1A1410">
@@ -316,6 +350,7 @@ function restoreBody(link, code) {
       This works once and expires in 2 hours. If you didn't ask for it, ignore
       it — nothing has changed.
     </div>
+  ${footerHtml()}
   </div></body></html>`;
 
   return { text, html };

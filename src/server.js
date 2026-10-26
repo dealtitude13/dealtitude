@@ -22,7 +22,7 @@ import {
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-26b";
+const BUILD = "2026-10-26d";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -1145,6 +1145,13 @@ app.get("/v1/me/alerts", async (c) => {
                  or d.sent_at > ${device.alerts_seen_at ?? null}::timestamptz)) as unread,
            p.id as post_id, p.kind, p.aisle, p.name, p.note,
            p.was_cents, p.now_cents, p.status,
+           /* When the deal runs out. The shopper's own copy of the alert was
+              the one screen that did not say — so somebody looking at a sale
+              they had been sent could not tell whether it was worth walking
+              over, which is the only question the card exists to answer.
+              Both spellings travel: ends_at is the instant, ends is the line
+              the shopkeeper's own screen shows. */
+           p.ends, p.ends_at,
            s.slug, s.name as shop_name, s.active as shop_live
       from deliveries d
       join posts p on p.id = d.post_id
@@ -1707,11 +1714,18 @@ const ShopEdit = z.object({
   })).max(7).optional(),
 });
 
-app.patch("/v1/owner/shops/:slug", async (c) => {
-  const owner = await needOwner(c);
-  const shop = await needShop(c, owner);          // membership is checked here
-  const b = parse(ShopEdit, await c.req.json());
-
+/* Applying an edit to a shop, once.
+ *
+ * Two callers reach this: the shopkeeper editing their own shop, and the
+ * operator fixing one from the admin screen. Only who is allowed differs, so
+ * only that part lives in the routes. A second copy of this would be two
+ * copies of the hours rebuild, the re-placing on the map and the aisle rules,
+ * and the day they drift is the day an operator's correction quietly behaves
+ * differently from the owner's.
+ *
+ * Returns { ok: true, shop } or { ok: false, status, message } — the caller
+ * turns a refusal into its own HTTP answer. */
+async function applyShopEdit(shop, b) {
   const patch = {};
   for (const k of ["name", "address", "town", "state", "zip", "hours", "phone",
                    "note", "daily_cap"]) {
@@ -1737,7 +1751,8 @@ app.patch("/v1/owner/shops/:slug", async (c) => {
       closes: r.closed ? null : (r.closes ?? null),
     }));
     const bad = rows.find((r) => !r.closed && (!r.opens || !r.closes));
-    if (bad) return fail(c, 400, "an open day needs both an opening and a closing time");
+    if (bad) return { ok: false, status: 400,
+      message: "an open day needs both an opening and a closing time" };
 
     await sql`delete from shop_hours where shop_id = ${shop.id}`;
     if (rows.length) await sql`insert into shop_hours ${sql(rows)}`;
@@ -1763,11 +1778,12 @@ app.patch("/v1/owner/shops/:slug", async (c) => {
      exists simply never matches a post again. */
   if (b.aisles) {
     const want = [...new Set(b.aisles.map((x) => x.trim()).filter(Boolean))];
-    if (!want.length) return fail(c, 400, "a shop needs at least one aisle");
+    if (!want.length) return { ok: false, status: 400,
+      message: "a shop needs at least one aisle" };
     /* Better here than one post at a time: an aisle that cannot exist has
        nothing to post into, and no shopper ever sees it offered. */
     const aisleHit = forbidden(...want);
-    if (aisleHit) return fail(c, 422, forbiddenMessage(aisleHit));
+    if (aisleHit) return { ok: false, status: 422, message: forbiddenMessage(aisleHit) };
     await sql`delete from shop_aisles where shop_id = ${shop.id}`;
     await sql`insert into shop_aisles ${sql(
       want.map((aisle, position) => ({ shop_id: shop.id, aisle, position })))}`;
@@ -1777,7 +1793,33 @@ app.patch("/v1/owner/shops/:slug", async (c) => {
   const aisles = (await sql`
     select aisle from shop_aisles where shop_id = ${shop.id} order by position`)
     .map((r) => r.aisle);
-  return c.json({ shop: { ...fresh, aisles } });
+  return { ok: true, shop: { ...fresh, aisles } };
+}
+
+/* The shopkeeper editing their own shop. */
+app.patch("/v1/owner/shops/:slug", async (c) => {
+  const owner = await needOwner(c);
+  const shop = await needShop(c, owner);          // membership is checked here
+  const r = await applyShopEdit(shop, parse(ShopEdit, await c.req.json()));
+  if (!r.ok) return fail(c, r.status, r.message);
+  return c.json({ shop: r.shop });
+});
+
+/* The operator fixing one.
+ *
+ * The same edit, reached with the operator key instead of a membership. It
+ * exists because details get mistyped at a counter and the operator is the
+ * one standing there — until now the only cure for a wrong address was to
+ * remove the shop and add it again, which takes it off the app in between and
+ * is drastic for a typo. */
+app.patch("/v1/admin/shops/:slug", async (c) => {
+  guard(c);
+  const [shop] = await sql`select * from shops where slug = ${c.req.param("slug")}`;
+  if (!shop) return fail(c, 404, "no such shop");
+  const r = await applyShopEdit(shop, parse(ShopEdit, await c.req.json()));
+  if (!r.ok) return fail(c, r.status, r.message);
+  console.log(`[admin] edited ${shop.slug}`);
+  return c.json({ shop: r.shop });
 });
 
 /* The owner's own name, which is all there is to an account here: sign-in is a
