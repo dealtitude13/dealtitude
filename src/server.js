@@ -5,6 +5,7 @@ import { cors } from "hono/cors";
 import { z } from "zod";
 import { sql, healthy } from "./db.js";
 import { zipPoint, milesBetween, knownZip, normalizeZip } from "./geo.js";
+import QR from "qrcode";
 import { summarise as summariseHours } from "./hours.js";
 import { forbidden, forbiddenMessage, forbiddenAskMessage } from "./forbidden.js";
 import { TERMS_VERSION, TERMS_TEXT, TERMS_SUMMARY, TERMS_SECTIONS,
@@ -22,7 +23,7 @@ import {
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-26d";
+const BUILD = "2026-10-26f";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -630,7 +631,20 @@ const shopShape = sql`
               'dow', h.dow, 'closed', h.closed,
               'opens', to_char(h.opens, 'HH24:MI'),
               'closes', to_char(h.closes, 'HH24:MI')) order by h.dow)
-              from shop_hours h where h.shop_id = s.id), '[]') as hours_rows`;
+              from shop_hours h where h.shop_id = s.id), '[]') as hours_rows,
+  /* How much this shop has on right now.
+   *
+   * The app worked this out by counting the shopper's own feed, which only
+   * carries posts from shops they already FOLLOW. So every shop in a search
+   * result read "nothing today" however much it had on — on the first screen
+   * a shopper ever sees, which is the screen that has to give them a reason
+   * to follow anything. It comes from the shop itself now.
+   *
+   * Counted the same way the feed decides a post is live, so the number on
+   * the card and the posts behind it cannot disagree. */
+  (select count(*)::int from posts p
+     where p.shop_id = s.id and p.status = 'active'
+       and (p.ends_at is null or p.ends_at > now())) as live_posts`;
 
 /* Shops near a ZIP, by actual distance.
  *
@@ -856,6 +870,40 @@ app.get("/v1/shops", async (c) => {
                   /* Said plainly so the app can explain an empty list rather
                      than implying there are no shops anywhere. */
                   unplaceable });
+});
+
+/* The QR code for a shop's counter card.
+ *
+ * Drawn here rather than in the app so the card page stays a plain page with
+ * no library in it, and so anything that needs this code — the printable
+ * page, a poster, a window sticker — gets the same one.
+ *
+ * Public, because all it encodes is the shop's own public address. Error
+ * correction is set high: this ends up on a counter, where it will be
+ * smudged, splashed and half-covered by a card reader.
+ *
+ * SVG rather than a bitmap: it is about 2KB, prints at whatever size the
+ * paper is, and never arrives as a blurry square on a 600dpi printer. */
+app.get("/v1/shops/:slug/qr.svg", async (c) => {
+  const slug = c.req.param("slug");
+  if (!/^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/.test(slug)) {
+    return fail(c, 400, "not a shop address");
+  }
+  const [shop] = await sql`select slug from shops where slug = ${slug} and active`;
+  if (!shop) return fail(c, 404, "no such shop");
+
+  /* The public web address, which is what is printed under the code too. */
+  const base = (process.env.APP_URL || "https://dealtitude.com").replace(/\/+$/, "");
+  const svg = await QR.toString(`${base}/${shop.slug}`, {
+    type: "svg", errorCorrectionLevel: "H", margin: 1,
+    color: { dark: "#1A1410", light: "#FFFDF8" },
+  });
+  return new Response(svg, { headers: {
+    "content-type": "image/svg+xml; charset=utf-8",
+    /* A shop's own code never changes while the shop exists. */
+    "cache-control": "public, max-age=86400",
+    "access-control-allow-origin": "*",
+  } });
 });
 
 app.get("/v1/shops/:slug", async (c) => {
