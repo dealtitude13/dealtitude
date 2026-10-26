@@ -4,7 +4,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
 import { sql, healthy } from "./db.js";
-import { zipPoint, milesBetween, knownZip } from "./geo.js";
+import { zipPoint, milesBetween, knownZip, normalizeZip } from "./geo.js";
 import { summarise as summariseHours } from "./hours.js";
 import { forbidden, forbiddenMessage, forbiddenAskMessage } from "./forbidden.js";
 import { TERMS_VERSION, TERMS_TEXT, TERMS_SUMMARY, TERMS_SECTIONS,
@@ -22,7 +22,7 @@ import {
 /* Bumped by hand with each handoff, and reported by /v1/health. The app shows
    the same stamp on its first screen, so one look at each says whether the two
    halves actually match. */
-const BUILD = "2026-10-26a";
+const BUILD = "2026-10-26b";
 
 /* Deliberately not just "is this not production": a pilot IS production here.
    It has to be switched on by hand and switched off again. */
@@ -654,7 +654,15 @@ const shopShape = sql`
  * searches cannot: there is no point to measure from, and a made-up distance
  * is worse than none.
  */
-const looksLikeZip = (q) => /^\d{5}$/.test(q);
+const looksLikeZip = (q) => normalizeZip(q) !== null && /^\s*\d{4,5}(-\d{4})?\s*$/.test(q);
+
+/* A ZIP as it arrives from a form: trimmed, ZIP+4 cut back, a leading zero
+   restored, and rejected only if it was never a ZIP. The regex this replaces
+   demanded exactly five digits, so a shopkeeper who read their ZIP off an
+   envelope with its +4 on it got a 400 and no explanation. */
+const ZipIn = z.string()
+  .transform((v) => normalizeZip(v))
+  .refine((v) => v !== null, { message: "that doesn't look like a ZIP code" });
 
 /* "Austin, TX" and "Austin TX" both mean the same thing to a person. A
    trailing two-letter word is a state if there is something before it. */
@@ -694,7 +702,7 @@ app.get("/v1/shops/search", async (c) => {
   /* A ZIP is answered by the route that knows about distance, so the caller
      gets the same shape either way and the app has one list to render. */
   if (looksLikeZip(q)) {
-    return c.redirect(`/v1/shops?zip=${q}` +
+    return c.redirect(`/v1/shops?zip=${normalizeZip(q)}` +
       (c.req.query("radius") ? `&radius=${c.req.query("radius")}` : ""), 307);
   }
 
@@ -1128,6 +1136,13 @@ app.get("/v1/me/alerts", async (c) => {
   const device = await need(c);
   const rows = await sql`
     select d.sent_at, d.opened_at,
+           /* Whether THIS row is still unread, by the same rule the count
+              below uses. Computed here rather than worked out again on the
+              phone: a dot that disagrees with the number beside it is worse
+              than either one being wrong on its own. */
+           (d.opened_at is null
+            and (${device.alerts_seen_at ?? null}::timestamptz is null
+                 or d.sent_at > ${device.alerts_seen_at ?? null}::timestamptz)) as unread,
            p.id as post_id, p.kind, p.aisle, p.name, p.note,
            p.was_cents, p.now_cents, p.status,
            s.slug, s.name as shop_name, s.active as shop_live
@@ -1675,7 +1690,7 @@ const ShopEdit = z.object({
   /* Upper-cased on the way in so "nj" and "NJ" are the same shop to a search. */
   state:     z.string().trim().regex(/^[A-Za-z]{2}$/)
                .transform((v) => v.toUpperCase()).nullable().optional(),
-  zip:       z.string().regex(/^\d{5}$/).optional(),
+  zip:       ZipIn.optional(),
   hours:     z.string().max(80).nullable().optional(),
   phone:     z.string().max(32).nullable().optional(),
   note:      z.string().max(280).nullable().optional(),
@@ -1730,8 +1745,9 @@ app.patch("/v1/owner/shops/:slug", async (c) => {
   }
   /* Moved town: put it back on the map, or distance silently keeps measuring
      from where it used to be. */
-  if (patch.zip && patch.zip !== shop.zip) {
+  if (patch.zip && normalizeZip(patch.zip) !== shop.zip) {
     const at = zipPoint(patch.zip);
+    patch.zip = normalizeZip(patch.zip) ?? patch.zip;
     patch.lat = at?.lat ?? null;
     patch.lon = at?.lon ?? null;
   }
@@ -1867,7 +1883,7 @@ const ShopIn = z.object({
      column arrived after the first shops did, and a shop is perfectly usable
      without one — it is simply not findable by a search that names a state. */
   state: z.string().trim().regex(/^[A-Za-z]{2}$/).nullable().optional(),
-  zip: z.string().regex(/^\d{5}$/),
+  zip: ZipIn,
   hours: z.string().max(80).optional(),
   daily_cap: z.number().int().min(1).max(10).default(3),
   aisles: z.array(z.string().max(40)).min(1).max(20),
@@ -1930,8 +1946,12 @@ app.post("/v1/admin/shops", async (c) => {
      distance to it has to either invent one or admit it cannot — the first of
      which is what went wrong. */
   const at = zipPoint(b.zip);
+  /* Stored canonically, so the ZIP on the shop is the ZIP a search compares
+     against. A shop entered as "08831-1234" used to be stored with the +4 on
+     it and then matched nothing. */
   const fields = {
-    name: b.name, address: b.address, town: b.town, zip: b.zip,
+    name: b.name, address: b.address, town: b.town,
+    zip: normalizeZip(b.zip) ?? b.zip,
     state: b.state ? b.state.toUpperCase() : null,
     hours: b.hours ?? null, daily_cap: b.daily_cap, min_age: b.min_age ?? null,
     lat: at?.lat ?? null, lon: at?.lon ?? null,
@@ -2363,6 +2383,62 @@ app.get("/v1/admin/shops", async (c) => {
   return c.json({ shops: rows.map((r) => ({ ...r, miles: null })) });
 });
 
+/* One shop, in full, for the operator.
+ *
+ * The list route carries what a list needs. This is what you want when you
+ * are on the phone to a shopkeeper: who holds the keys, whether anything has
+ * ever been posted, whether it is actually on the map, and when it was added.
+ * Counted per shop rather than added to the list query, which would run four
+ * subqueries across every shop on the app to fill a screen showing one.
+ *
+ * Everything here is already in the database. There is no logo, description or
+ * category to return, because the app has never asked a shop for one — and a
+ * field invented here would read on screen as a thing somebody forgot to fill
+ * in rather than a thing that does not exist. */
+app.get("/v1/admin/shops/:slug", async (c) => {
+  guard(c);
+  const [shop] = await sql`
+    select ${shopShape}, s.lat, s.lon, s.active, s.created_at, s.updated_at,
+           coalesce((select array_agg(a.aisle order by a.position, a.aisle)
+                       from shop_aisles a where a.shop_id = s.id), '{}') as aisles,
+           followers_for(s.id) as followers
+      from shops s where s.slug = ${c.req.param("slug")}`;
+  if (!shop) return fail(c, 404, "no such shop");
+
+  const [owners, invites, posts, reach, terms] = await Promise.all([
+    sql`select o.id, o.email, m.role, m.created_at
+          from memberships m join owners o on o.id = m.owner_id
+         where m.shop_id = ${shop.id} order by o.email`,
+    /* invites keeps no created_at — only when it runs out. */
+    sql`select email, expires_at, role
+          from invites where shop_id = ${shop.id} and accepted_at is null
+         order by expires_at desc`,
+    sql`select count(*)::int as total,
+               count(*) filter (where status = 'active')::int as live,
+               max(created_at) as last_at
+          from posts where shop_id = ${shop.id}`,
+    sql`select count(*)::int as sent,
+               count(*) filter (where opened_at is not null)::int as opened
+          from deliveries where shop_id = ${shop.id} and withheld is null`,
+    sql`select o.email, t.version, t.accepted_at
+          from memberships m
+          join owners o on o.id = m.owner_id
+          join owner_terms t on t.owner_id = o.id
+         where m.shop_id = ${shop.id}
+         order by t.accepted_at desc limit 1`,
+  ]);
+
+  return c.json({
+    shop: { ...shop, placed: shop.lat != null && shop.lon != null },
+    owners, invites,
+    posts: posts[0] ?? { total: 0, live: 0, last_at: null },
+    reach: reach[0] ?? { sent: 0, opened: 0 },
+    /* Who signed the undertaking, if anybody has. An operator ringing a shop
+       about a post needs to know whether that shop ever agreed to the terms. */
+    terms: terms[0] ?? null,
+  });
+});
+
 /* Blocking without a report in hand, and letting one back in. Both exist
    because the first block made in anger is the one that needs undoing. */
 app.post("/v1/admin/devices/:id/block", async (c) => {
@@ -2387,15 +2463,26 @@ app.post("/v1/admin/devices/:id/block", async (c) => {
  * no-op on every boot after the first. */
 async function placeUnplacedShops() {
   try {
-    const rows = await sql`select id, zip from shops where lat is null`;
-    let placed = 0;
+    /* Shops with no coordinates, and shops whose stored ZIP is not the
+       canonical five digits. The second set exists because a ZIP typed with
+       its +4, or one that lost a leading zero on its way through a
+       spreadsheet, was stored exactly as typed and then matched nothing.
+       Both are fixed from the one place that knows what a ZIP is. */
+    const rows = await sql`select id, zip, lat from shops`;
+    let placed = 0, tidied = 0;
     for (const r of rows) {
-      const at = zipPoint(r.zip);
+      const canon = normalizeZip(r.zip);
+      const at = r.lat == null ? zipPoint(r.zip) : null;
+      if (canon && canon !== r.zip) {
+        await sql`update shops set zip = ${canon} where id = ${r.id}`;
+        tidied++;
+      }
       if (!at) continue;
       await sql`update shops set lat = ${at.lat}, lon = ${at.lon} where id = ${r.id}`;
       placed++;
     }
     if (placed) console.log(`[geo] placed ${placed} shop(s) from their ZIP`);
+    if (tidied) console.log(`[geo] tidied ${tidied} ZIP(s) to five digits`);
   } catch (e) {
     /* Never block startup on this: the app works without it, shops just stay
        findable by exact ZIP only. */
